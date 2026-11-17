@@ -37,8 +37,9 @@ type Options struct {
 // Proxy is the client-facing http.Handler.
 type Proxy struct {
 	arb     *arbiter.Arbiter
-	cache   *cache                            // nil without a store
+	cache   *cache                            // built over the arbiter; its store may be nil, so no session files
 	proxies map[string]*httputil.ReverseProxy // by route id
+	models  map[string]string                 // route id → the model it answers for: resident_info and the refusal message
 	m       *Metrics
 	maxBody int64
 	log     *slog.Logger
@@ -49,22 +50,22 @@ type Proxy struct {
 
 // New returns a proxy over the arbiter's routes.
 func New(opt Options) *Proxy {
-	p := &Proxy{arb: opt.Arbiter, maxBody: opt.MaxBody, m: opt.Metrics, log: opt.Log, proxies: map[string]*httputil.ReverseProxy{}}
+	p := &Proxy{arb: opt.Arbiter, maxBody: opt.MaxBody, m: opt.Metrics, log: opt.Log,
+		proxies: map[string]*httputil.ReverseProxy{}, models: map[string]string{}}
 	if opt.Arbiter != nil {
 		p.cache = newCache(opt.Arbiter, opt.Store, opt.Metrics, opt.Log, opt.Policy)
 		// A swap ends both engines' live conversations: the arbiter says so, and the
 		// cache must stop calling a request a continuation of a conversation the
 		// engine no longer holds.
 		opt.Arbiter.SetObservers(observers{m: opt.Metrics, c: p.cache})
-		routes := map[string]string{}
 		for _, r := range opt.Arbiter.Routes() {
 			p.proxies[r.ID] = reverseProxy(r, opt.Log)
-			routes[r.ID] = r.Model
+			p.models[r.ID] = r.Model
 		}
 		if opt.Metrics != nil {
 			// resident_info needs the route→model table before the first request,
 			// and the route the arbiter says owns the card at startup gets its 1.
-			opt.Metrics.SetRoutes(routes)
+			opt.Metrics.SetRoutes(p.models)
 			opt.Metrics.SeedResident(opt.Arbiter.Resident())
 		}
 	}
@@ -163,16 +164,44 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	gen := r.Method == http.MethodPost &&
 		(r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/responses")
 	if !gen {
-		// A control call goes to the route that is resident, never to a model that is
-		// not: a per-model endpoint on an idle router loads that model.
-		route := p.arb.Resident()
-		if route == "" {
-			route = p.arb.RouteOf("").ID
-		}
+		// A control call goes to the route that is resident, never to a model that
+		// is not: a per-model endpoint on an idle router loads that model. In strict
+		// mode the body is read for a model name before a byte reaches an engine, so
+		// the rule is one rule across every path — the model a request names has to
+		// be the model the card holds, and the route the request is forwarded to is
+		// the route the rule checked, read once. A POST that names none (/slots,
+		// /v1/unload, a raw prompt) goes to the resident, as before. In single-route
+		// mode there is no rule to check, so no control body is read at all.
+		resident := p.arb.Resident()
+		strict := p.arb.Strict()
 		if p.cache != nil && r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
+			if strict {
+				head, err := io.ReadAll(io.LimitReader(r.Body, prefixRead))
+				if err != nil {
+					http.Error(w, "reading the request body: "+err.Error(), http.StatusBadRequest)
+					return
+				}
+				r.Body = struct {
+					io.Reader
+					io.Closer
+				}{io.MultiReader(bytes.NewReader(head), r.Body), r.Body}
+				if model := modelOf(head); model != "" {
+					if !p.arb.Serves(model) {
+						p.notServed(w, r, model)
+						return
+					}
+					if p.arb.RouteOf(model).ID != resident {
+						p.refused(w, r, model, (&arbiter.NotResident{Model: model, ResidentModel: p.models[resident]}).Error(), actRefused)
+						return
+					}
+				}
+			}
 			p.cache.invalidate() // /v1/completions, /slots, /load ...: a live conversation may have changed
 		}
-		p.proxies[route].ServeHTTP(w, r)
+		if resident == "" {
+			resident = p.arb.RouteOf("").ID // the card is idle: the first route answers
+		}
+		p.proxies[resident].ServeHTTP(w, r)
 		return
 	}
 
@@ -200,22 +229,27 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		p.log.Warn("not admitted", "model", model, "err", err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = io.WriteString(w, `{"error":{"type":"server_error","code":503,"message":"the GPU is busy: `+err.Error()+`"}}`)
+		if r.Context().Err() != nil {
+			// The client walked away while the request waited for the card. Nobody is
+			// left to answer, and a request that never got the card is not a denial
+			// the operator has to read: no record, no counter, no body.
+			return
+		}
+		p.denied(w, r, model, err)
 		return
 	}
 	defer rel()
 	if int64(len(body)) > p.maxBody {
 		// The body is streamed through as it is, unbuffered from here. No key, so
-		// no session copy, no restore, and the route's live-conversation belief is
-		// cleared when the request ends (finish), because the engine now holds a
-		// conversation this cache cannot name.
+		// no session copy, no restore: the request is registered as engine-touching
+		// at admission (touch), and that clears every route's live-conversation
+		// belief on the way in — the engine is about to hold a conversation this
+		// cache cannot name — which finish then keeps cleared.
 		r.Body = struct {
 			io.Reader
 			io.Closer
 		}{io.MultiReader(bytes.NewReader(body), r.Body), r.Body}
-		t.route = p.cache.route(rt.ID)
+		t = p.cache.touch(p.cache.route(rt.ID))
 	} else {
 		r.Body, r.ContentLength, r.TransferEncoding = io.NopCloser(bytes.NewReader(body)), int64(len(body)), nil
 		t = p.cache.prepare(r.Context(), r.URL.Path, body, p.cache.route(rt.ID))
@@ -240,31 +274,59 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.proxies[t.route.id].ServeHTTP(sw, r)
 }
 
-// notServed answers a generation request whose model this arbiter does not
-// serve, in the error shape the client reads. The arbiter's answer is the message:
-// one source for what the rule says. The refusal is recorded with the request, so
-// a 404 is visible in /requests and in the metrics, not only in the log.
-func (p *Proxy) notServed(w http.ResponseWriter, r *http.Request, model string) {
-	e := &arbiter.NoRoute{Model: model}
-	p.log.Warn("model not served", "model", model)
+// refused answers a request the proxy turned away, in the error shape the client
+// reads, and records it: a 404 has to be visible in /requests and in
+// requests_total, not only in the log. The route is left empty — the engine was
+// never touched.
+func (p *Proxy) refused(w http.ResponseWriter, r *http.Request, model, msg, action string) {
+	p.log.Warn("refused", "model", model, "msg", msg)
 	client, _, _ := net.SplitHostPort(r.RemoteAddr)
 	p.remember(record{At: float64(time.Now().UnixMicro()) / 1e6, Path: r.URL.Path, Client: client,
-		UserAgent: r.UserAgent(), Model: model, Action: actRefused, Route: ""})
+		UserAgent: r.UserAgent(), Model: model, Action: action, Route: ""})
 	if p.m != nil {
-		p.m.Request(actRefused)
+		p.m.Request(action)
 	}
 	b, _ := json.Marshal(map[string]any{"error": map[string]any{"type": "invalid_request_error",
-		"message": e.Error()}})
+		"message": msg}})
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusNotFound)
 	_, _ = w.Write(b)
 }
 
+// notServed answers a request whose model this arbiter does not serve. The arbiter
+// is the source of what it serves, so the message comes from its NoRoute: one
+// place says what the rule is.
+func (p *Proxy) notServed(w http.ResponseWriter, r *http.Request, model string) {
+	p.refused(w, r, model, (&arbiter.NoRoute{Model: model}).Error(), actRefused)
+}
+
+// denied answers a request whose model this arbiter serves, when the card was busy
+// for it: 503, recorded in /requests and counted as action="denied", so a denial
+// is read next to the refusals, not only in the log.
+func (p *Proxy) denied(w http.ResponseWriter, r *http.Request, model string, err error) {
+	p.log.Warn("not admitted", "model", model, "err", err)
+	client, _, _ := net.SplitHostPort(r.RemoteAddr)
+	p.remember(record{At: float64(time.Now().UnixMicro()) / 1e6, Path: r.URL.Path, Client: client,
+		UserAgent: r.UserAgent(), Model: model, Action: actDenied, Route: ""})
+	if p.m != nil {
+		p.m.Request(actDenied)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_, _ = io.WriteString(w, `{"error":{"type":"server_error","code":503,"message":"the GPU is busy: `+err.Error()+`"}}`)
+}
+
+// prefixRead is how much of a control POST is read for its model name. llama.cpp's
+// per-model endpoints take the model in the body, so the strict rule has to see it
+// before a byte reaches an engine; a longer body is forwarded whole, unbuffered.
+const prefixRead = 64 << 10
+
 // modelOf is the request's model name, "" when the body names none. It reads the
 // prefix, not the whole body: a body cut at --max-body-mib keeps the model, which
-// is the first key in every client's request. A strict request whose prefix names
-// no model is refused, because no route can be chosen for it; a non-strict one goes
-// to the resident, so it never triggers a swap.
+// is the first key in every client's request. A generation request whose prefix
+// names no model is refused in strict mode, because no route can be chosen for it;
+// a control POST that names no model goes to the resident, as it always has, so it
+// never triggers a swap.
 func modelOf(body []byte) string {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	tok, err := dec.Token()

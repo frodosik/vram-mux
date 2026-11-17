@@ -45,7 +45,7 @@ type Fake struct {
 	Unloaded     bool          // engine unloaded: no /metrics fingerprint, slot calls refused
 	Down         bool          // every request answers 503
 	actions      []string      // "save NAME", "restore NAME", "gen PATH", "other METHOD PATH"
-	Bodies       []string      // the bodies of generation requests, in order
+	Bodies       []string      // the bodies of generation requests and control calls, in order
 	entered      chan string   // when set, each slot call reports itself here first
 }
 
@@ -76,6 +76,15 @@ func (f *Fake) Take() []string {
 	a := f.actions
 	f.actions = nil
 	return a
+}
+
+// TakeBodies returns and clears the bodies seen so far.
+func (f *Fake) TakeBodies() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b := f.Bodies
+	f.Bodies = nil
+	return b
 }
 
 // Entered returns a channel that receives "save" or "restore" as each slot call starts.
@@ -117,7 +126,11 @@ func (f *Fake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/responses":
 		f.gen(w, r) // unlocks
 	default:
+		// A control call: the body is read whole, so a test can see that everything
+		// the proxy forwarded arrived.
+		body, _ := io.ReadAll(r.Body)
 		f.actions = append(f.actions, "other "+r.Method+" "+r.URL.Path)
+		f.Bodies = append(f.Bodies, string(body))
 		f.mu.Unlock()
 		fmt.Fprintf(w, "host=%s path=%s", r.Host, r.URL.Path)
 	}

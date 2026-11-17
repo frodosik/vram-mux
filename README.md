@@ -139,10 +139,12 @@ Each flag can also be set through its environment variable. The flag wins.
 
 `/metrics` on `--metrics-listen` is Prometheus text, with the Go runtime and process metrics alongside:
 
-- `strata_diskcache_requests_total{action}`: what happened to each generation request. `continue` means it
-  continued the live conversation, `ram` a switch to a parked one, `disk` a restore from file, `miss` no copy
-  anywhere, `busy` other requests in flight, `unkeyed` a body it couldn't key, `pass` Strata didn't answer, `error`
-  the proxy's own failure, `refused` the model it named is not served by this arbiter (a 404).
+- `strata_diskcache_requests_total{action}`: what happened to each generation request, and to every request the
+  proxy turned away. `continue` means it continued the live conversation, `ram` a switch to a parked one, `disk` a
+  restore from file, `miss` no copy anywhere, `busy` other requests in flight, `unkeyed` a body it couldn't key,
+  `pass` Strata didn't answer, `error` the proxy's own failure, `refused` the model it named is not served by this
+  arbiter, or is served by a route that does not hold the card (a 404), `denied` a model this arbiter serves and
+  the card was busy for (a 503).
 - `strata_diskcache_saves_total`, `strata_diskcache_saves_by_trigger_total{trigger=idle|switch|yield}`,
   `strata_diskcache_saves_skipped_total{reason}`, `strata_diskcache_restores_total`. `yield` is the save of the
   conversation the card held when the arbiter gave the card away.
@@ -158,9 +160,11 @@ Each flag can also be set through its environment variable. The flag wins.
   `strata_diskcache_reloads_total{route}` (a resident route loaded from cold), `strata_diskcache_queue_length`.
 
 `/requests` lists the last 256 generation requests with the client address, User-Agent, the model the request
-named, the route that answered, and the cache action; a refused request is listed with an empty route. Strata
-only sees the proxy's address, so a tracer that reads Strata's request log can join these on by path and start time.
-A request whose model was answered by a different route than the one it named is the aliasing this field shows.
+named, the route that answered, and the cache action; a refused (404) or denied (503) request is listed with an
+empty route, because no engine was touched — a control POST naming a model that is not the resident's is listed
+there too. Strata only sees the proxy's address, so a tracer that reads Strata's request log can join these on by
+path and start time. A request whose model was answered by a different route than the one it named is the aliasing
+this field shows.
 
 Logs are structured (`slog`). Every generation request gets one `request` line at info level, with the path,
 client, the model named, the route that answered, action, reason, tokens, how long the cache took and the whole

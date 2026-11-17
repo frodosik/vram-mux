@@ -701,6 +701,25 @@ func TestFailOpen(t *testing.T) {
 		t.Error("a raw completion did not make the live conversation unknown")
 	}
 
+	// a POST outside the generation paths that names a model is read for that name
+	// before it reaches the engine: naming the resident's model passes through in
+	// strict mode too (the rule is the model the card holds, not the endpoint), and
+	// the conversation it touched becomes unknown. Naming a model the arbiter does
+	// not serve, or one that is not resident, is answered 404: see
+	// TestStrictNonGenPOSTToOtherModelIsRefused.
+	req, _ = http.NewRequest(http.MethodPost, e.url+"/v1/completions", strings.NewReader(`{"model":"test-model","prompt":"x"}`))
+	req.Host = "llm.example:8080"
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	want(t, "model-naming pass-through", string(b), "host=llm.example:8080 path=/v1/completions")
+	if got := e.turn("A", 4); got == actContinue {
+		t.Error("a completion naming the resident's model did not make the live conversation unknown")
+	}
+
 	// a panic in the cache logic: the request still goes through
 	e.p.cache.files = nil
 	e.f.Set(20000, 0)

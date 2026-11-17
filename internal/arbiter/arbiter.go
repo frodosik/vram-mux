@@ -56,11 +56,13 @@ type Observers interface {
 // Options configure the arbiter.
 type Options struct {
 	Routes []Route
-	// Strict makes every generation request name one of the routes: a request
-	// whose model is not one of them is refused with NoRoute, not answered by the
-	// resident. Set when --route flags were configured. The single route built from
-	// --upstream is not strict: it answers every request, and the proxy logs the
-	// model each request asked for so the aliasing is visible in the log.
+	// Strict makes a request name one of the routes: a request whose model is not
+	// one of them is refused with NoRoute, not answered by the resident, and a
+	// control POST that names a model of another route is refused too — the rule is
+	// one rule across every path. Set when --route flags were configured. The single
+	// route built from --upstream is not strict: it answers every request, and the
+	// proxy logs the model each request asked for so the aliasing is visible in the
+	// log.
 	Strict bool
 	// MaxResidentStreak: admissions of the resident before a waiter may take the
 	// card; <= 0: unbounded
@@ -150,11 +152,11 @@ func New(opt Options) *Arbiter {
 	return a
 }
 
-// RouteOf resolves the route a control call belongs to. Control calls (/slots,
-// /props, /load, /v1/completions) carry no model, and a per-model endpoint on an
-// idle router loads that model, so they go to the resident, and to the first
-// route when the card is idle. Generation requests name a model and go through
-// Acquire, which refuses a model it does not serve when Strict is set.
+// RouteOf resolves the route a control call belongs to: the resident, and the first
+// route when the card is idle. Control calls (/slots, /props, /load, a raw prompt)
+// carry no model, and a per-model endpoint on an idle router loads that model, so
+// this is the only routing a control call gets. Generation requests name a model and
+// go through Acquire, which refuses a model it does not serve when Strict is set.
 func (a *Arbiter) RouteOf(model string) Route {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -175,6 +177,28 @@ func (a *Arbiter) Resident() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.resident
+}
+
+// Serves reports whether model is one of the arbiter's routes. It is the strict
+// rule's source, and load-bearing on the one path Acquire does not cover: a control
+// POST that names a model is answered 404 when this arbiter does not serve it, and
+// 404 again when its route is not the resident. The rule has to be readable where
+// the request is forwarded, not only inside Acquire.
+func (a *Arbiter) Serves(model string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_, ok := a.byModel[model]
+	return ok
+}
+
+// Strict reports that a request has to name one of the arbiter's routes. It is set
+// when the routes came from --route flags. Load-bearing: the rule is read in two
+// places — Acquire for a generation request, and the proxy's control path for a
+// POST that names a model — and both read this one source.
+func (a *Arbiter) Strict() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.opt.Strict
 }
 
 // Acquire makes model's route the resident, waiting behind the resident's queued
@@ -452,4 +476,18 @@ func (e *NoRoute) Error() string {
 		return "the request names no model"
 	}
 	return "model " + e.Model + " is not served by this arbiter"
+}
+
+// NotResident is a model this arbiter serves on a route that does not hold the
+// card. Naming it is the aliasing strict mode exists to catch: answered by the
+// resident, the client gets a model the card does not hold; answered by its own
+// route, that model is loaded on an idle card with no yield save of the
+// conversation the card holds. The proxy answers 404 and touches no engine.
+type NotResident struct{ Model, ResidentModel string }
+
+func (e *NotResident) Error() string {
+	if e.ResidentModel == "" {
+		return "the card is idle, so model " + e.Model + " has no resident route"
+	}
+	return "model " + e.Model + " is not the resident; " + e.ResidentModel + " holds the card"
 }

@@ -29,6 +29,17 @@
   its prefix is made the resident before the bytes reach a server, so an oversized request never runs on a route
   whose model is not loaded. The model is read from the prefix (a truncated body keeps it), and a refusal is
   recorded in `/requests` and in `requests_total{action="refused"}`.
+- An oversized generation body is registered as engine-touching at admission (`inflight`/`seq`), the bookkeeping a
+  keyed request pays: the idle save of the turn before it finds the card busy and steps out, instead of writing
+  behind the request and holding the save lock for its length.
+- **A control POST is checked against the resident too**: in strict mode a POST outside the three generation
+  paths is read for a model name (a 64 KiB prefix) before a byte reaches an engine, and a POST naming a model that
+  is not the resident's, or that no route serves, is answered 404 with no engine touched; the rest of the body is
+  forwarded whole. A POST that names no model (`/slots`, `/v1/unload`, a raw prompt) goes to the resident, as
+  before, and in single-route mode no control body is read at all.
+- A 503 for a card that was busy for a served model is recorded in `/requests` and counted as
+  `requests_total{action="denied"}`, so a denial is read next to the 404 refusals, not only in the log. A request
+  whose client walked away while it waited for the card is not counted: no record, no counter, no 503 body.
 
 - **Flags take two dashes** (`--session-dir`, not `-session-dir`). The environment variables are unchanged.
 - `go install` path is now `github.com/tfyl/strata-diskcache/cmd/strata-diskcache@latest`.

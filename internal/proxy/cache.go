@@ -50,6 +50,7 @@ const (
 	actUnkeyed  = "unkeyed"  // a body the cache can't key
 	actPass     = "pass"     // the engine didn't answer, or the body was too big to look at
 	actRefused  = "refused"  // the model the request named is not one this arbiter serves
+	actDenied   = "denied"   // a served model the card was busy for: 503
 	actError    = "error"    // the cache's own logic failed
 )
 
@@ -316,6 +317,24 @@ func (c *cache) prepare(ctx context.Context, path string, body []byte, r *route)
 		t.action, t.reason = actMiss, "restore_failed"
 		c.m.prefill(len(keys))
 	}
+	return t
+}
+
+// touch registers a request the cache cannot key — a body over --max-body-mib,
+// streamed through unbuffered — as engine-touching at admission, the bookkeeping
+// prepare does for a keyed request: inflight++ and seq++, decremented at finish.
+// It matters because an oversized request runs on the very engine a background save
+// writes to: idleSave's quiet reads inflight and seq, so a request that is not
+// registered lets the idle save of the turn before it start on a busy card and hold
+// the save lock for the request's length. The live-conversation belief is cleared
+// here too: this engine now holds a conversation the cache cannot name.
+func (c *cache) touch(r *route) *ticket {
+	c.mu.Lock()
+	c.inflight++
+	c.seq++
+	t := &ticket{route: r, action: actPass, reason: "body_too_large", seq: c.seq, counted: true}
+	c.mu.Unlock()
+	c.invalidate()
 	return t
 }
 

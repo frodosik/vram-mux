@@ -218,14 +218,38 @@ func (f *llamaFake) gen(w http.ResponseWriter, r *http.Request) {
 // with a small MinTokens so the short test conversations are saved.
 func twoRouteEnv(t *testing.T) (*Proxy, *stratatest.Fake, *llamaFake, *store.Store, string, *syncBuffer, string) {
 	t.Helper()
-	return twoRouteEnvWith(t, false, 0, 10*time.Millisecond, 64<<20, "")
+	return twoRouteEnvWith(t, envOpts{idle: 10 * time.Millisecond})
 }
 
-// twoRouteEnvWith is the same, with strict mode (a request must name one of the
-// routes), the idle-save token cap, the idle delay, the body limit, and the route
-// that owns the card at startup ("" = nobody, as a fresh arbiter sees).
-func twoRouteEnvWith(t *testing.T, strict bool, maxIdle int, idle time.Duration, maxBody int64, initialResident string) (*Proxy, *stratatest.Fake, *llamaFake, *store.Store, string, *syncBuffer, string) {
+// envOpts is the two-route environment's knobs: strict mode (a request must name
+// one of the routes), the idle-save token cap, the idle delay, the body limit, the
+// route that owns the card at startup ("" = nobody, as a fresh arbiter sees), the
+// VRAM the 27B route asks for, the free VRAM the gate sees, and the time a swap
+// gets. Zero values are the plain environment.
+type envOpts struct {
+	strict          bool
+	maxIdleSave     int
+	idle            time.Duration
+	maxBody         int64
+	initialResident string
+	llamaNeed       int64 // bytes of VRAM the 27B route needs; 0: gate on the margin only
+	vramFree        func() (int64, error)
+	loadTimeout     time.Duration
+}
+
+// twoRouteEnvWith is twoRouteEnv with those knobs set.
+func twoRouteEnvWith(t *testing.T, o envOpts) (*Proxy, *stratatest.Fake, *llamaFake, *store.Store, string, *syncBuffer, string) {
 	t.Helper()
+	maxBody, loadTimeout := o.maxBody, o.loadTimeout
+	if maxBody == 0 {
+		maxBody = 64 << 20
+	}
+	if loadTimeout <= 0 {
+		loadTimeout = 30 * time.Second
+	}
+	if o.vramFree == nil {
+		o.vramFree = func() (int64, error) { return 1 << 40, nil }
+	}
 	dir := t.TempDir()
 	logs := &syncBuffer{}
 	log := slog.New(slog.NewJSONHandler(logs, nil))
@@ -245,24 +269,25 @@ func twoRouteEnvWith(t *testing.T, strict bool, maxIdle int, idle time.Duration,
 		t.Fatal(err)
 	}
 	arb := arbiter.New(arbiter.Options{
-		Strict: strict,
+		Strict: o.strict,
 		Routes: []arbiter.Route{
 			{ID: "strata/flash", Dialect: "strata", Model: "flash", Base: strataServer.URL,
 				Namespace: store.NamespaceOf("strata", "flash"),
 				Engine:    engine.NewStrata(engine.Options{ID: "strata/flash", Model: "flash", Base: strataServer.URL})},
 			{ID: "llama/swift", Dialect: "llama", Model: "swift", Base: llamaServer.URL, APIKey: "k",
+				Need:      o.llamaNeed,
 				Namespace: store.NamespaceOf("llama", "swift"),
 				Engine:    engine.NewLlama(engine.Options{ID: "llama/swift", Model: "swift", Base: llamaServer.URL, APIKey: "k"})},
 		},
-		MaxResidentStreak: 32, LoadTimeout: 30 * time.Second, VRAMMargin: 0,
-		VRAMFree:        func() (int64, error) { return 1 << 40, nil },
+		MaxResidentStreak: 32, LoadTimeout: loadTimeout, VRAMMargin: 0,
+		VRAMFree:        o.vramFree,
 		PollInterval:    10 * time.Millisecond,
-		InitialResident: initialResident,
+		InitialResident: o.initialResident,
 		Log:             log,
 	})
 	p := New(Options{Arbiter: arb, Store: st, MaxBody: maxBody, Metrics: NewMetrics(prometheus.NewRegistry()), Log: log,
-		Policy: Policy{MinTokens: 10, ParkMinTokens: -1, RegrowTokens: 0, IdleDelay: idle,
-			MaxIdleSaveTokens: maxIdle, SnapshotBytesPerToken: 64 << 10, BodyDivisor: 4,
+		Policy: Policy{MinTokens: 10, ParkMinTokens: -1, RegrowTokens: 0, IdleDelay: o.idle,
+			MaxIdleSaveTokens: o.maxIdleSave, SnapshotBytesPerToken: 64 << 10, BodyDivisor: 4,
 			MemAvailable: func() (int64, error) { return 8 << 30, nil }}})
 	px := httptest.NewServer(p)
 	t.Cleanup(func() { px.Close(); _ = p.Close(context.Background()) })
@@ -512,7 +537,7 @@ func postBody(t *testing.T, url, body string) (int, string) {
 // the label it asked for, and its token counts, session files and the harness's
 // model name all inherit the substitution.
 func TestStrictRefusesAnUnknownModel(t *testing.T) {
-	p, _, llama, _, url, logs, _ := twoRouteEnvWith(t, true, 0, 10*time.Millisecond, 64<<20, "")
+	p, _, llama, _, url, logs, _ := twoRouteEnvWith(t, envOpts{strict: true, idle: 10 * time.Millisecond})
 	if n := postModel(t, url, "flash", withModel("flash", conversation("A", 2))); n == 0 {
 		t.Fatal("flash turn failed")
 	}
@@ -550,7 +575,7 @@ func TestStrictRefusesAnUnknownModel(t *testing.T) {
 // Strict mode refuses a generation request that names no model: the arbiter does
 // not choose for a client that asked for none.
 func TestStrictRefusesARequestWithNoModel(t *testing.T) {
-	p, _, _, _, url, logs, _ := twoRouteEnvWith(t, true, 0, 10*time.Millisecond, 64<<20, "")
+	p, _, _, _, url, logs, _ := twoRouteEnvWith(t, envOpts{strict: true, idle: 10 * time.Millisecond})
 	status, body := postBody(t, url, conversation("A", 3))
 	if status != http.StatusNotFound {
 		t.Fatalf("status %d, want 404", status)
@@ -570,7 +595,7 @@ func TestStrictRefusesARequestWithNoModel(t *testing.T) {
 // skipped: a 100K-token session writes 1.4 GB in ~110 s behind the save lock, and
 // the yield save at the next switch writes the same file in ~4 s.
 func TestIdleSaveSkipsALongConversation(t *testing.T) {
-	p, _, _, _, url, logs, dir := twoRouteEnvWith(t, false, 1000, 10*time.Millisecond, 64<<20, "")
+	p, _, _, _, url, logs, dir := twoRouteEnvWith(t, envOpts{maxIdleSave: 1000, idle: 10 * time.Millisecond})
 	if status, _ := postBody(t, url, withModel("flash", longBody(2000))); status != 200 {
 		t.Fatalf("status %d, want 200", status)
 	}
@@ -580,11 +605,13 @@ func TestIdleSaveSkipsALongConversation(t *testing.T) {
 	}
 }
 
-// A request already queued for the card is not made to wait for a background
-// save: the idle save steps out of the way, and the switch save on that request
-// writes the file.
+// A request already queued for the card is not made to wait for a background save:
+// the idle save steps out of the way. The conversation's file is then written by the
+// yield save at the switch that request pays for, in ~4 s rather than the ~110 s
+// behind the save lock. TestQueueWiringMakesTheIdleSaveStepOut is the same guard on
+// the real admission path.
 func TestIdleSaveStepsOutForAQueuedRequest(t *testing.T) {
-	p, _, _, _, url, logs, dir := twoRouteEnvWith(t, false, 0, 200*time.Millisecond, 64<<20, "")
+	p, _, _, _, url, logs, dir := twoRouteEnvWith(t, envOpts{idle: 200 * time.Millisecond})
 	if status, _ := postBody(t, url, withModel("flash", conversation("A", 3))); status != 200 {
 		t.Fatalf("status %d", status)
 	}
@@ -678,7 +705,7 @@ func gaugeSeries(t *testing.T, reg *prometheus.Registry, name string) map[string
 // the card, 1 for the one that does. A gauge that only appears after a route's
 // first swap leaves an operator guessing which model owns the card.
 func TestResidentInfoNamesTheModelFromTheStart(t *testing.T) {
-	p, _, _, _, url, _, _ := twoRouteEnvWith(t, true, 0, 10*time.Millisecond, 64<<20, "")
+	p, _, _, _, url, _, _ := twoRouteEnvWith(t, envOpts{strict: true, idle: 10 * time.Millisecond})
 	reg := p.m.registry()
 	want := map[string]float64{"model=flash route=strata/flash": 0, "model=swift route=llama/swift": 0}
 	got := gaugeSeries(t, reg, "strata_diskcache_resident_info")
@@ -708,7 +735,7 @@ func TestResidentInfoNamesTheModelFromTheStart(t *testing.T) {
 // is not loaded, and the conversation the card holds is yielded by the swap.
 // The model is read from the prefix, so a body cut at the limit is still routed.
 func TestOversizedBodyIsAdmittedToItsRoute(t *testing.T) {
-	p, strata, llama, _, url, _, _ := twoRouteEnvWith(t, true, 0, 10*time.Millisecond, 4096, "")
+	p, strata, llama, _, url, _, _ := twoRouteEnvWith(t, envOpts{strict: true, idle: 10 * time.Millisecond, maxBody: 4096})
 	if status, _ := postBody(t, url, withModel("flash", conversation("A", 3))); status != 200 {
 		t.Fatalf("status %d, want 200", status)
 	}
@@ -737,7 +764,7 @@ func TestOversizedBodyIsAdmittedToItsRoute(t *testing.T) {
 // The oversized path is the same rule: a model the arbiter does not serve is
 // refused, not answered by the resident. Its name is in the prefix the proxy read.
 func TestStrictOversizedBodyIsRefusedByTheSameRule(t *testing.T) {
-	p, _, llama, _, url, logs, _ := twoRouteEnvWith(t, true, 0, 10*time.Millisecond, 4096, "")
+	p, _, llama, _, url, logs, _ := twoRouteEnvWith(t, envOpts{strict: true, idle: 10 * time.Millisecond, maxBody: 4096})
 	if status, _ := postBody(t, url, withModel("flash", conversation("A", 2))); status != 200 {
 		t.Fatalf("status %d, want 200", status)
 	}
@@ -761,11 +788,12 @@ func TestStrictOversizedBodyIsRefusedByTheSameRule(t *testing.T) {
 
 // The queue the arbiter observes is what makes a background save step out of the
 // way. The wiring, not a direct call: a slow load keeps one admission running, the
-// next request for that route is queued, and the idle save fires while the queue
-// is not empty, so it skips and the switch save on the queued request writes the
-// file.
+// next request for that route is queued, and the idle save fires while the queue is
+// not empty, so it steps out. flash's file comes from the yield save B's admission
+// pays for the card, not from a background save: the arbiter calls SaveLive before
+// it gives the card away, and that write is trigger="yield".
 func TestQueueWiringMakesTheIdleSaveStepOut(t *testing.T) {
-	p, _, llama, _, url, logs, dir := twoRouteEnvWith(t, false, 0, 250*time.Millisecond, 64<<20, "")
+	p, _, llama, _, url, logs, dir := twoRouteEnvWith(t, envOpts{idle: 250 * time.Millisecond})
 	llama.LoadDelay = 400 * time.Millisecond
 	if status, _ := postBody(t, url, withModel("flash", conversation("A", 3))); status != 200 {
 		t.Fatalf("status %d, want 200", status)
@@ -804,8 +832,8 @@ func TestQueueWiringMakesTheIdleSaveStepOut(t *testing.T) {
 	if n := count(llama.Take(), "load swift"); n != 1 {
 		t.Errorf("%d loads of the 27B route, want exactly one", n)
 	}
-	// The background save never ran; the switch save on B's admission did.
-	eventually(t, "flash's file from the switch save", func() bool { return len(filesIn(t, p, "strata/flash", dir)) == 1 })
+	// The background save never ran; the yield save at B's swap wrote the file.
+	eventually(t, "flash's file from the yield save", func() bool { return len(filesIn(t, p, "strata/flash", dir)) == 1 })
 }
 
 // The arbiter is told which route owns the card at startup (the --lazy Strata
@@ -813,12 +841,230 @@ func TestQueueWiringMakesTheIdleSaveStepOut(t *testing.T) {
 // every route is not enough: a reader of resident_info at startup sees nobody
 // owning the card, which is the mixup this gauge exists to make visible.
 func TestResidentInfoSeedsTheInitialResident(t *testing.T) {
-	p, _, _, _, _, _, _ := twoRouteEnvWith(t, true, 0, 10*time.Millisecond, 64<<20, "strata/flash")
+	p, _, _, _, _, _, _ := twoRouteEnvWith(t, envOpts{strict: true, idle: 10 * time.Millisecond, initialResident: "strata/flash"})
 	got := gaugeSeries(t, p.m.registry(), "strata_diskcache_resident_info")
 	if got["model=flash route=strata/flash"] != 1 {
 		t.Errorf("the initial resident's gauge is %v, want 1 before any request", got["model=flash route=strata/flash"])
 	}
 	if got["model=swift route=llama/swift"] != 0 {
 		t.Errorf("the idle route's gauge is %v, want 0", got["model=swift route=llama/swift"])
+	}
+}
+
+// A body over --max-body-mib runs on the engine for its whole length, and the cache
+// never sees a key for it, so prepare never runs. The idle save's guard reads the
+// cache's inflight count and turn number (quiet), so an oversized request has to be
+// registered as engine-touching at admission: with it, the background save of the
+// turn before finds the card busy and steps out; without it, the save starts on the
+// engine this request is running on and holds the save lock for its length.
+func TestOversizedRequestKeepsTheIdleSaveOffTheEngine(t *testing.T) {
+	p, strata, _, _, url, logs, dir := twoRouteEnvWith(t, envOpts{strict: true, idle: 150 * time.Millisecond, maxBody: 4096})
+	strata.Update(func(f *stratatest.Fake) { f.GenDelay = 400 * time.Millisecond })
+	if status, _ := postBody(t, url, withModel("flash", conversation("A", 3))); status != 200 {
+		t.Fatalf("status %d, want 200", status)
+	}
+	body := withModel("flash", longBody(1500)) // ~7.5 KB: over the 4 KiB limit
+	if len(body) <= 4096 {
+		t.Fatalf("test body is %d bytes, want over the limit", len(body))
+	}
+	// The engine sleeps 400 ms in gen, so flash's idle save (150 ms after the
+	// first turn) fires while this request is in flight.
+	if status, _ := postBody(t, url, body); status != 200 {
+		t.Fatalf("oversized status %d, want 200", status)
+	}
+	if strings.Contains(logs.String(), `"trigger":"idle"`) {
+		t.Error("a background save ran on the engine an oversized request was running on")
+	}
+	if len(filesIn(t, p, "strata/flash", dir)) != 0 {
+		t.Error("the background save wrote the file behind the oversized request")
+	}
+}
+
+// postControl sends a POST to a path outside the generation endpoints and returns
+// the status and the answer body.
+func postControl(t *testing.T, url, path, body string) (int, string) {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodPost, url+path, strings.NewReader(body))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b)
+}
+
+// A POST outside the three generation paths is not a free pass to the route that
+// happens to hold the card: /v1/completions names a model, and a model-naming call
+// answered by the resident gives the client a model the card does not hold, and a
+// per-model endpoint on an idle route loads that model on the card. In strict mode
+// the same rule covers both paths: a POST that names a model has to name the
+// resident's, and a POST that names none goes to the resident.
+func TestStrictNonGenPOSTToOtherModelIsRefused(t *testing.T) {
+	p, _, llama, _, url, logs, _ := twoRouteEnvWith(t, envOpts{strict: true})
+	if status, _ := postBody(t, url, withModel("flash", conversation("A", 2))); status != 200 {
+		t.Fatalf("status %d, want 200", status)
+	}
+	for _, model := range []string{"swift", "ghost"} {
+		status, body := postControl(t, url, "/v1/completions", `{"model":"`+model+`","prompt":"x","max_tokens":8}`)
+		if status != http.StatusNotFound {
+			t.Fatalf("a completions POST naming %s: status %d, want 404", model, status)
+		}
+		if !strings.Contains(body, `"type":"invalid_request_error"`) {
+			t.Errorf("body %q, want the client's error shape", body)
+		}
+		if !strings.Contains(body, model) {
+			t.Errorf("body %q, want the refused model named", body)
+		}
+		// The refusal is a request: recorded in /requests with the model it named, and
+		// with no route, because no engine was touched.
+		if rec := p.requestsJSON(); !strings.Contains(rec, `"model":"`+model+`"`) || !strings.Contains(rec, `"diskcache":"refused"`) {
+			t.Errorf("/requests %q, want the %s refusal recorded", rec, model)
+		}
+	}
+	if llama.Take() != nil {
+		t.Error("a request for the 27B model reached that engine")
+	}
+	if p.Resident() != "strata/flash" {
+		t.Errorf("resident %q, want flash still resident", p.Resident())
+	}
+	if !strings.Contains(logs.String(), `"model":"swift"`) {
+		t.Error("the log does not name the refused model")
+	}
+	if v := counterValue(t, p.m.registry(), "strata_diskcache_requests_total", "action", "refused"); v != 2 {
+		t.Errorf(`requests_total{action="refused"} = %v, want 2`, v)
+	}
+}
+
+// A control POST that names no model — llama.cpp's /slots, Strata's /v1/unload, a
+// raw prompt — goes to the route that holds the card, strict mode included: the
+// rule is about the model a body names, not about every POST.
+func TestControlPOSTWithNoModelGoesToResident(t *testing.T) {
+	p, strata, llama, _, url, _, _ := twoRouteEnvWith(t, envOpts{strict: true})
+	if status, _ := postBody(t, url, withModel("flash", conversation("A", 2))); status != 200 {
+		t.Fatalf("status %d, want 200", status)
+	}
+	strata.Take()
+	status, body := postControl(t, url, "/slots/0?action=save", `{"filename":"dc-0000.session"}`)
+	if status != 200 {
+		t.Fatalf("model-less control POST: status %d, want 200, body %q", status, body)
+	}
+	if n := count(strata.Take(), "save"); n != 1 {
+		t.Errorf("%d slot calls on Strata, want the resident to answer the control POST", n)
+	}
+	if llama.Take() != nil {
+		t.Error("a model-less control POST reached the other engine")
+	}
+	if p.Resident() != "strata/flash" {
+		t.Errorf("resident %q, want the resident to answer", p.Resident())
+	}
+}
+
+// The control POST that names the resident's own model reaches the engine, strict
+// mode included: the rule is which model the card holds, not which endpoint. Its
+// live conversation becomes unknown, as with any request the cache did not see into.
+func TestStrictControlPOSTNamingTheResidentPassesThrough(t *testing.T) {
+	p, strata, llama, _, url, _, _ := twoRouteEnvWith(t, envOpts{strict: true})
+	if status, _ := postBody(t, url, withModel("flash", conversation("A", 2))); status != 200 {
+		t.Fatalf("status %d, want 200", status)
+	}
+	strata.Take()
+	status, body := postControl(t, url, "/v1/completions", `{"model":"flash","prompt":"x","max_tokens":8}`)
+	if status != 200 {
+		t.Fatalf("a completions POST naming the resident's model: status %d, want 200, body %q", status, body)
+	}
+	acts := strata.Take()
+	if n := count(acts, "other POST /v1/completions"); n != 1 {
+		t.Errorf("Strata actions %v, want the resident to answer the request", acts)
+	}
+	if llama.Take() != nil {
+		t.Error("a request for the resident's model reached the other engine")
+	}
+	if p.Resident() != "strata/flash" {
+		t.Errorf("resident %q, want the resident to answer", p.Resident())
+	}
+}
+
+// The card being busy for a served model is a refusal an operator has to see: 503,
+// recorded in /requests and counted as action="denied", next to the 404 refusals.
+func TestBusyCardIsRecordedLikeARefusal(t *testing.T) {
+	p, _, llama, _, url, _, _ := twoRouteEnvWith(t, envOpts{strict: true, llamaNeed: 1 << 30,
+		vramFree: func() (int64, error) { return 0, nil }, loadTimeout: 50 * time.Millisecond})
+	status, body := postBody(t, url, withModel("swift", conversation("B", 2)))
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status %d, want 503, body %q", status, body)
+	}
+	if !strings.Contains(body, "the GPU is busy") {
+		t.Errorf("body %q, want the busy card named as the reason", body)
+	}
+	if llama.Take() != nil {
+		t.Error("the refused request touched the 27B engine")
+	}
+	if p.Resident() != "" {
+		t.Errorf("resident %q, want the card untouched", p.Resident())
+	}
+	rec := p.requestsJSON()
+	if !strings.Contains(rec, `"model":"swift"`) || !strings.Contains(rec, `"diskcache":"denied"`) {
+		t.Errorf("/requests %q, want the denied model and the denial recorded", rec)
+	}
+	if v := counterValue(t, p.m.registry(), "strata_diskcache_requests_total", "action", "denied"); v != 1 {
+		t.Errorf(`requests_total{action="denied"} = %v, want 1`, v)
+	}
+}
+
+// The prefix read is a bound, not a truncation: a control POST longer than the
+// prefix is forwarded whole, exactly as it was before the rule existed. A 70 KiB
+// body naming the resident's model reaches the engine byte for byte.
+func TestControlPOSTLongerThanThePrefixIsForwardedWhole(t *testing.T) {
+	p, strata, _, _, url, _, _ := twoRouteEnvWith(t, envOpts{strict: true})
+	if status, _ := postBody(t, url, withModel("flash", conversation("A", 2))); status != 200 {
+		t.Fatalf("status %d, want 200", status)
+	}
+	strata.Take()
+	strata.TakeBodies()
+	body := `{"model":"flash","prompt":"` + strings.Repeat("x", 70<<10) + `"}`
+	status, answer := postControl(t, url, "/v1/completions", body)
+	if status != 200 {
+		t.Fatalf("status %d, want 200, answer %q", status, answer)
+	}
+	acts := strata.Take()
+	if n := count(acts, "other POST /v1/completions"); n != 1 {
+		t.Errorf("Strata actions %v, want the resident to answer it", acts)
+	}
+	got := strata.TakeBodies()
+	if len(got) != 1 {
+		t.Fatalf("%d bodies at the engine, want the one 70 KiB control POST", len(got))
+	}
+	if got[0] != body {
+		t.Errorf("the engine got %d bytes, want the whole %d-byte body", len(got[0]), len(body))
+	}
+	if p.Resident() != "strata/flash" {
+		t.Errorf("resident %q, want the resident to answer", p.Resident())
+	}
+}
+
+// A client that walks away while its request waits for the card is not a denial:
+// nobody is left to read a 503, and a request that never got the card is not a
+// denial the operator has to count. No record, no counter, no engine touched.
+func TestClientGoneWhileWaitingIsNotADenial(t *testing.T) {
+	p, _, llama, _, url, _, _ := twoRouteEnvWith(t, envOpts{strict: true, llamaNeed: 1 << 30,
+		vramFree: func() (int64, error) { return 0, nil }, loadTimeout: 30 * time.Second})
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url+"/v1/chat/completions",
+		strings.NewReader(withModel("swift", conversation("B", 2))))
+	resp, err := http.DefaultClient.Do(req)
+	if err == nil {
+		_ = resp.Body.Close()
+		t.Fatalf("the client should have been cut off, got status %d", resp.StatusCode)
+	}
+	if rec := p.requestsJSON(); strings.Contains(rec, `"model":"swift"`) {
+		t.Errorf("/requests %q, want no record for a request whose client walked away", rec)
+	}
+	if v := counterValue(t, p.m.registry(), "strata_diskcache_requests_total", "action", "denied"); v != -1 {
+		t.Errorf(`requests_total{action="denied"} = %v, want no denial counted`, v)
+	}
+	if llama.Take() != nil {
+		t.Error("the cancelled request touched the 27B engine")
 	}
 }
