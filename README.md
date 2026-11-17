@@ -120,6 +120,7 @@ Each flag can also be set through its environment variable. The flag wins.
 | `--min-tokens` | `MIN_TOKENS` | `15000` | don't save shorter conversations |
 | `--regrow-tokens` | `REGROW_TOKENS` | `4096` | save again once a conversation has grown this much past its file |
 | `--idle-save-s` | `IDLE_SAVE_S` | `3` | quiet seconds after a turn before saving; `0` saves only when a switch would lose it |
+| `--max-idle-save-tokens` | `MAX_IDLE_SAVE_TOKENS` | `32768` | skip a background idle save of a longer conversation, and skip it while a request is queued for the card; `0` is no cap |
 | `--park-min-tokens` | `PARK_MIN_TOKENS` | `-1` | Strata's `--conversation-cache-min-tokens`; `-1` reads it from Strata |
 | `--snapshot-bytes-per-token` | `SNAPSHOT_BYTES_PER_TOKEN` | `65536` | RAM a parked conversation takes per token, used to predict when Strata will refuse to park one |
 | `--max-body-mib` | `MAX_BODY_MIB` | `64` | larger request bodies are streamed through without caching |

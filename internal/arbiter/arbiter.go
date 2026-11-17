@@ -55,8 +55,16 @@ type Observers interface {
 
 // Options configure the arbiter.
 type Options struct {
-	Routes            []Route
-	MaxResidentStreak int           // admissions of the resident before a waiter may take the card; <= 0: unbounded
+	Routes []Route
+	// Strict makes every generation request name one of the routes: a request
+	// whose model is not one of them is refused with NoRoute, not answered by the
+	// resident. Set when --route flags were configured. The single route built from
+	// --upstream is not strict: it answers every request, and the proxy logs the
+	// model each request asked for so the aliasing is visible in the log.
+	Strict bool
+	// MaxResidentStreak: admissions of the resident before a waiter may take the
+	// card; <= 0: unbounded
+	MaxResidentStreak int
 	DrainWait         time.Duration // how long an unload waits for a running turn (Strata's ?wait=)
 	LoadTimeout       time.Duration // the whole swap: drain, VRAM gate, load
 	VRAMMargin        int64         // bytes that must stay free on the card after a load
@@ -142,9 +150,11 @@ func New(opt Options) *Arbiter {
 	return a
 }
 
-// RouteOf resolves the route a request's model name belongs to. An unknown
-// model, or no model at all, goes to the route the arbiter starts with: the
-// default is the resident, so a model-name-less request never triggers a swap.
+// RouteOf resolves the route a control call belongs to. Control calls (/slots,
+// /props, /load, /v1/completions) carry no model, and a per-model endpoint on an
+// idle router loads that model, so they go to the resident, and to the first
+// route when the card is idle. Generation requests name a model and go through
+// Acquire, which refuses a model it does not serve when Strict is set.
 func (a *Arbiter) RouteOf(model string) Route {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -159,6 +169,18 @@ func (a *Arbiter) RouteOf(model string) Route {
 	}
 	return Route{}
 }
+
+// Serves reports whether model is one of the arbiter's routes.
+func (a *Arbiter) Serves(model string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_, ok := a.byModel[model]
+	return ok
+}
+
+// Strict reports that the routes were configured with --route flags, so a request
+// must name one of them.
+func (a *Arbiter) Strict() bool { return a.opt.Strict }
 
 // Resident is the route holding the card now, "" when idle.
 func (a *Arbiter) Resident() string {
@@ -178,14 +200,22 @@ func (a *Arbiter) Acquire(ctx context.Context, model string) (Route, func(), err
 	defer a.mu.Unlock()
 	r, ok := a.byModel[model]
 	if !ok {
-		// A request that names no model, or one this arbiter does not know, goes to
-		// the resident: it must never take the card to a model nobody asked for.
+		if a.opt.Strict {
+			// The arbiter serves exactly the models it was given. A request naming
+			// a model that is not one of them, or naming none, is refused: answering
+			// it with the route that happens to hold the card gives the client a
+			// different model under the label it asked for, and its token counts,
+			// session files and the harness's model name all inherit the lie.
+			return Route{}, nil, &NoRoute{Model: model}
+		}
+		// Single-route mode: the one route answers every request, whatever the body
+		// names. The proxy logs the requested model, so the aliasing is visible.
 		if a.resident != "" {
 			r = a.byID[a.resident]
 		} else if len(a.opt.Routes) > 0 {
 			r = a.opt.Routes[0]
 		} else {
-			return Route{}, nil, errNoRoute(model)
+			return Route{}, nil, &NoRoute{Model: model}
 		}
 	}
 	w := &waiter{route: r.ID, token: a.next}
@@ -426,8 +456,12 @@ func (a *Arbiter) observe() {
 
 func (a *Arbiter) log() *slog.Logger { return a.opt.Log }
 
-type noRoute struct{ model string }
+// NoRoute is a model this arbiter does not serve. The proxy answers it with 404.
+type NoRoute struct{ Model string }
 
-func (e *noRoute) Error() string { return "arbiter: no route for model " + e.model }
-
-func errNoRoute(model string) error { return &noRoute{model} }
+func (e *NoRoute) Error() string {
+	if e.Model == "" {
+		return "the request names no model"
+	}
+	return "model " + e.Model + " is not served by this arbiter"
+}

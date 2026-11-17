@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -54,8 +55,14 @@ func New(opt Options) *Proxy {
 		// cache must stop calling a request a continuation of a conversation the
 		// engine no longer holds.
 		opt.Arbiter.SetObservers(observers{m: opt.Metrics, c: p.cache})
+		routes := map[string]string{}
 		for _, r := range opt.Arbiter.Routes() {
 			p.proxies[r.ID] = reverseProxy(r, opt.Log)
+			routes[r.ID] = r.Model
+		}
+		if opt.Metrics != nil {
+			// resident_info needs the route→model table before the first request.
+			opt.Metrics.SetRoutes(routes)
 		}
 	}
 	return p
@@ -87,6 +94,9 @@ func (o observers) SwapBlocked(reason string) {
 func (o observers) Queue(n int, resident string) {
 	if o.m != nil {
 		o.m.Queue(n, resident)
+	}
+	if o.c != nil {
+		o.c.Queue(n, resident)
 	}
 }
 
@@ -166,24 +176,42 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	t := &ticket{action: actPass, reason: "body_too_large"}
 	body, err := io.ReadAll(io.LimitReader(r.Body, p.maxBody+1))
-	switch {
-	case err != nil:
+	if err != nil {
 		http.Error(w, "reading the request body: "+err.Error(), http.StatusBadRequest)
 		return
-	case int64(len(body)) > p.maxBody: // stream it through as it is, unbuffered from here
+	}
+	model := modelOf(body) // what the client asked for, read from the buffered prefix
+	if int64(len(body)) > p.maxBody {
+		// The body is streamed through as it is, unbuffered from here, and no
+		// admission is paid for it. The route that is resident answers it, exactly
+		// as before — unless the model it names is served by another route, which
+		// gets it, or is not served at all, which is refused by the same rule as an
+		// admitted request.
 		r.Body = struct {
 			io.Reader
 			io.Closer
 		}{io.MultiReader(bytes.NewReader(body), r.Body), r.Body}
 		p.cache.invalidate()
-		t.route = p.cache.route(p.home()) // streamed whole: the resident serves it
-	default:
+		switch {
+		case p.arb.Serves(model):
+			t.route = p.cache.route(p.arb.RouteOf(model).ID)
+		case p.arb.Strict():
+			p.notServed(w, model)
+			return
+		default:
+			t.route = p.cache.route(p.home()) // streamed whole: the resident serves it
+		}
+	} else {
 		r.Body, r.ContentLength, r.TransferEncoding = io.NopCloser(bytes.NewReader(body)), int64(len(body)), nil
 		// The arbiter owns the card: make this request's model the resident, behind
 		// the resident's queued turns, before anything is sent to a server.
-		model := modelOf(body)
 		rt, rel, err := p.arb.Acquire(r.Context(), model)
 		if err != nil {
+			var nr *arbiter.NoRoute
+			if errors.As(err, &nr) {
+				p.notServed(w, nr.Model)
+				return
+			}
 			p.log.Warn("not admitted", "model", model, "err", err)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -196,19 +224,34 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	prepared := time.Since(start)
 	client, _, _ := net.SplitHostPort(r.RemoteAddr)
 	p.remember(record{At: float64(time.Now().UnixMicro()) / 1e6, Path: r.URL.Path, Client: client,
-		UserAgent: r.UserAgent(), Action: t.action, Route: t.route.id})
+		UserAgent: r.UserAgent(), Model: model, Action: t.action, Route: t.route.id})
 
 	// tail starts with a newline so the first chunk can be seen as a line start
 	sw := &statusWriter{ResponseWriter: w, status: http.StatusOK, tail: []byte{'\n'}}
 	defer func() {
 		gone := r.Context().Err() != nil && !sw.done
 		p.cache.finish(t, sw.status, gone)
-		// one line per request: what the cache decided, never what was said
-		p.log.Info("request", "path", r.URL.Path, "client", client, "route", t.route.id, "action", t.action,
-			"reason", t.reason, "tokens", t.tokens, "prepare_ms", prepared.Milliseconds(), "status", sw.status,
-			"client_gone", gone, "ms", time.Since(start).Milliseconds())
+		// one line per request: what the cache decided, never what was said. The
+		// requested model is logged with the route that answered, so an alias
+		// (single-route mode) is visible in the log, not only in the client's label.
+		p.log.Info("request", "path", r.URL.Path, "client", client, "model", model, "route", t.route.id,
+			"action", t.action, "reason", t.reason, "tokens", t.tokens, "prepare_ms", prepared.Milliseconds(),
+			"status", sw.status, "client_gone", gone, "ms", time.Since(start).Milliseconds())
 	}()
 	p.proxies[t.route.id].ServeHTTP(sw, r)
+}
+
+// notServed answers a generation request whose model this arbiter does not
+// serve, in the error shape the client reads. The arbiter's answer is the message:
+// one source for what the rule says.
+func (p *Proxy) notServed(w http.ResponseWriter, model string) {
+	e := &arbiter.NoRoute{Model: model}
+	p.log.Warn("model not served", "model", model)
+	b, _ := json.Marshal(map[string]any{"error": map[string]any{"type": "invalid_request_error",
+		"message": e.Error()}})
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotFound)
+	_, _ = w.Write(b)
 }
 
 // home is the route a request that names no model, or cannot be keyed, belongs
@@ -303,7 +346,8 @@ type record struct {
 	Path      string  `json:"path"`
 	Client    string  `json:"client"`
 	UserAgent string  `json:"user_agent"`
-	Route     string  `json:"route"`
+	Model     string  `json:"model"` // the model the request named
+	Route     string  `json:"route"` // the route that answered it
 	Action    string  `json:"diskcache"`
 }
 
@@ -316,13 +360,19 @@ func (p *Proxy) remember(r record) {
 	}
 }
 
-// Requests serves the last 256 generation requests as JSON.
-func (p *Proxy) Requests(w http.ResponseWriter, _ *http.Request) {
+// requestsJSON is the /requests body, shared by the handler and the tests.
+func (p *Proxy) requestsJSON() string {
 	p.mu.Lock()
 	recs := append([]record(nil), p.recent...)
 	p.mu.Unlock()
+	b, _ := json.Marshal(map[string]any{"requests": recs})
+	return string(b)
+}
+
+// Requests serves the last 256 generation requests as JSON.
+func (p *Proxy) Requests(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"requests": recs})
+	_, _ = io.WriteString(w, p.requestsJSON())
 }
 
 // Resident is the route holding the card, for /health.

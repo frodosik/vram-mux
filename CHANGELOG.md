@@ -9,11 +9,20 @@
   longer wakes an engine by sending a request. A load the engine refuses is fail-open.
 - The VRAM gate asks for a route's floor, not what it fills, and auto-detects the card with the
   most VRAM when `--vram-sysfs` is left at its default.
-- A save's bytes-per-token estimate is learned only from a save of at least `--min-tokens`, so a
-  short conversation's file does not poison the next reserve.
+- A save's bytes-per-token estimate is learned only from a save of at least `--min-tokens`, and is
+  clamped to 4 KB..256 KB/token, so a short conversation's file does not poison the next reserve.
 - The instance port is not part of a llama fingerprint, so slot files survive a router restart.
 - `reloads_total{route}` is exported, and `swap_blocked_total` reports `reason="reload"` for a
   reload that the gate refused.
+- **A request must name a served model** when the routes were configured with `--route` flags: a
+  model the arbiter does not serve, or no model at all, is answered 404, not by the route that
+  happens to hold the card. In single-route mode the resident answers, and the request line and
+  `/requests` carry the model that was asked for next to the route that answered.
+- `--max-idle-save-tokens` (default 32768) skips a background idle save of a longer conversation,
+  and an idle save is skipped while a request is queued for the card: the 1.4 GB a 100K-token
+  session writes takes ~110 s behind the save lock, and the yield save at the switch writes the
+  same file in ~4 s.
+- `strata_diskcache_resident_info{route,model}` shows which model owns the card.
 
 - **Flags take two dashes** (`--session-dir`, not `-session-dir`). The environment variables are unchanged.
 - `go install` path is now `github.com/tfyl/strata-diskcache/cmd/strata-diskcache@latest`.

@@ -792,7 +792,7 @@ func TestKeys(t *testing.T) {
 // 32 KB/token default, which fits.
 func TestSmallSaveDoesNotPoisonTheEstimate(t *testing.T) {
 	e := setup(t, time.Second, 1<<20)
-	e.f.Update(func(f *stratatest.Fake) { f.Tokens, f.SavedTokens, f.SaveBytes = 175000, 74, 226 << 20 })
+	e.f.Update(func(f *stratatest.Fake) { f.Tokens, f.SavedTokens, f.SaveBytes = 175000, 74, 226<<20 })
 
 	if status, _ := e.post(context.Background(), "/v1/chat/completions", longBody(20000)); status != 200 {
 		t.Fatalf("the first long body: status %d", status)
@@ -810,4 +810,26 @@ func TestSmallSaveDoesNotPoisonTheEstimate(t *testing.T) {
 func longBody(words int) string {
 	return `{"stream":true,"messages":[{"role":"system","content":"` + strings.Repeat("word ", words) +
 		`"},{"role":"user","content":"u"}]}`
+}
+
+// The single route built from --upstream answers every request, whatever the body
+// names. The request line carries the model that was asked for next to the route
+// that answered, so an alias is visible in the log and not only in the client's
+// label. Strict mode refuses it instead; see TestStrictRefusesAnUnknownModel.
+func TestSingleRouteLogsTheRequestedModel(t *testing.T) {
+	e := setup(t, 0, 64<<20)
+	body := `{"model":"qwen3.8-swift-1.5-architect","stream":true,"messages":[{"role":"user","content":"u"}]}`
+	if status, _ := e.post(context.Background(), "/v1/chat/completions", body); status != 200 {
+		t.Fatalf("status %d, want the single route to answer", status)
+	}
+	logs := e.logs.String()
+	if !strings.Contains(logs, `"model":"qwen3.8-swift-1.5-architect"`) {
+		t.Error("the log does not name the model the request asked for")
+	}
+	if !strings.Contains(logs, `"route":"strata/test-model"`) {
+		t.Error("the log does not name the route that answered")
+	}
+	if !strings.Contains(e.p.requestsJSON(), `"model":"qwen3.8-swift-1.5-architect"`) {
+		t.Error("/requests does not show the requested model")
+	}
 }

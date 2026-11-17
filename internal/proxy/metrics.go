@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -18,7 +19,10 @@ type Metrics struct {
 	swapSeconds                                                            prometheus.Histogram
 	swapBlocked                                                            *prometheus.CounterVec
 	queue                                                                  prometheus.Gauge
-	resident                                                               *prometheus.GaugeVec
+	resident, residentInfo                                                 *prometheus.GaugeVec
+
+	mu     sync.Mutex
+	models map[string]string // route id → model, the arbiter's route table
 }
 
 // NewMetrics registers the metrics with reg.
@@ -60,10 +64,13 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		lastSave:    prometheus.NewGauge(prometheus.GaugeOpts(opts("last_save_ms", "Duration of the last save."))),
 		lastRestore: prometheus.NewGauge(prometheus.GaugeOpts(opts("last_restore_ms", "Duration of the last restore."))),
 		resident:    prometheus.NewGaugeVec(prometheus.GaugeOpts(opts("resident_route", "1 for the route holding the card.")), []string{"route"}),
+		residentInfo: prometheus.NewGaugeVec(prometheus.GaugeOpts(opts("resident_info",
+			"The route holding the card and the model it answers for; 1 for the resident, 0 for the rest.")),
+			[]string{"route", "model"}),
 	}
 	reg.MustRegister(m.requests, m.savesBy, m.skipped, m.failures, m.evictions, m.evictedBytes, m.reloads,
 		m.saves, m.restores, m.savedBytes, m.restoredBytes, m.panics, m.swaps, m.prefillTokens,
-		m.saveSeconds, m.restoreSeconds, m.swapSeconds, m.swapBlocked, m.queue, m.resident,
+		m.saveSeconds, m.restoreSeconds, m.swapSeconds, m.swapBlocked, m.queue, m.resident, m.residentInfo,
 		m.lastSave, m.lastRestore)
 	return m
 }
@@ -107,13 +114,39 @@ func (m *Metrics) prefill(tokens int) {
 	m.prefillTokens.Add(float64(tokens))
 }
 
+// SetRoutes is the arbiter's route table (route id → model) so resident_info can
+// name the model a route answers for. Called once, at startup, before any request.
+func (m *Metrics) SetRoutes(byRoute map[string]string) {
+	m.mu.Lock()
+	m.models = byRoute
+	m.mu.Unlock()
+}
+
+// setResidentInfo writes resident_info for one route. A route the metrics have no
+// model for is skipped: the label has to name the model, not guess it.
+func (m *Metrics) setResidentInfo(route string, on bool) {
+	m.mu.Lock()
+	model := m.models[route]
+	m.mu.Unlock()
+	if model == "" {
+		return
+	}
+	if on {
+		m.residentInfo.WithLabelValues(route, model).Set(1)
+	} else {
+		m.residentInfo.WithLabelValues(route, model).Set(0)
+	}
+}
+
 // Swap is the arbiter's Observers.Swap.
 func (m *Metrics) Swap(from, to string, seconds float64) {
 	m.swaps.Inc()
 	m.swapSeconds.Observe(seconds)
 	m.resident.WithLabelValues(to).Set(1)
+	m.setResidentInfo(to, true)
 	if from != "" {
 		m.resident.WithLabelValues(from).Set(0)
+		m.setResidentInfo(from, false)
 	}
 }
 
@@ -132,5 +165,6 @@ func (m *Metrics) Queue(n int, resident string) {
 	m.queue.Set(float64(n))
 	if resident != "" {
 		m.resident.WithLabelValues(resident).Set(1)
+		m.setResidentInfo(resident, true)
 	}
 }

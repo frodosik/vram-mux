@@ -19,6 +19,12 @@ type Policy struct {
 	ParkMinTokens int           // the engine parks only these; -1 asks the engine
 	RegrowTokens  int           // save again once a conversation has grown this much past its file
 	IdleDelay     time.Duration // quiet time after a turn before it is saved; 0: never
+	// MaxIdleSaveTokens: the background idle save is skipped above this. A
+	// 100K-token session writes 1.4 GB in ~110 s, and the save holds the save
+	// lock, so a queued request waits for it. The yield save at a switch writes the
+	// same file in ~4 s, and the shutdown save at SIGTERM, so skipping the idle save
+	// costs nothing the next request will not get. 0: no cap.
+	MaxIdleSaveTokens int
 	// RAM per token of a parked conversation's snapshot, to predict a refused park
 	SnapshotBytesPerToken int64
 	MemAvailable          func() (int64, error) // default strata.MemAvailable
@@ -26,6 +32,13 @@ type Policy struct {
 	// bytes per token. 0: never estimate, only what the engine reports.
 	BodyDivisor int
 }
+
+// The bounds a learned bytes-per-token figure is clamped to. Measured: Strata k8v4
+// 13.8 KB/token, a llama slot 85.7 KB/token.
+const (
+	minBPT = 4 << 10
+	maxBPT = 256 << 10
+)
 
 // Actions, one per generation request.
 const (
@@ -78,6 +91,7 @@ type cache struct {
 	mu       sync.Mutex
 	cur      *route // the route the last request used, the one idle saves watch
 	inflight int
+	queued   int // requests waiting for the card, as the arbiter last reported them
 	seq      uint64
 	idle     *time.Timer
 }
@@ -455,13 +469,23 @@ func (c *cache) save(ctx context.Context, r *route, fp string, live []string, to
 		return
 	}
 	c.m.saved(trigger, e.Size, d)
-	// A small conversation's file is mostly fixed overhead, so its bytes-per-token
-	// is not the figure for the next reserve: learning 3 MB/token from a 74-token
-	// save makes a 168K-token session look like it cannot fit, and the save is
-	// skipped. Only a save of a conversation worth saving sets the estimate.
+	// A save's bytes-per-token is learned, and clamped. The measured figures are
+	// Strata k8v4 at 13.8 KB/token and a llama slot (f16 KV + draft layers) at
+	// 85.7 KB/token, so 4 KB..256 KB/token covers both dialects and nothing sane: a
+	// file that is mostly fixed overhead (226 MB for 74 tokens = 3 MB/token) is
+	// clamped down, and a route whose files are unusually dense is clamped up. A
+	// clamped figure keeps the next reserve finite: the poison case read a 168K
+	// session as 515 GB, over the cap, so the save was skipped and the session lost.
 	if e.Tokens >= c.pol.MinTokens {
+		bpt := e.Size / int64(e.Tokens)
+		if bpt < minBPT {
+			bpt = minBPT
+		}
+		if bpt > maxBPT {
+			bpt = maxBPT
+		}
 		c.mu.Lock()
-		r.bpt = e.Size / int64(e.Tokens)
+		r.bpt = bpt
 		c.mu.Unlock()
 	}
 	c.log.Info("save", "route", r.id, "trigger", trigger, "tokens", e.Tokens, "mb", e.Size>>20, "ms", d.Milliseconds())
@@ -552,8 +576,21 @@ func (c *cache) finish(t *ticket, status int, clientGone bool) {
 	}
 }
 
+// Queue is the arbiter's Observers.Queue. The cache keeps the count so a
+// background save can step out of the way of requests that are already waiting
+// for the card: the save would hold the save lock for its whole duration, and the
+// waiting request pays for it before its own swap.
+func (c *cache) Queue(n int, _ string) {
+	c.mu.Lock()
+	c.queued = n
+	c.mu.Unlock()
+}
+
 // idleSave saves the live conversation of the route the last turn used, if
-// nothing has started since the turn numbered seq ended.
+// nothing has started since the turn numbered seq ended. Two guards keep the save
+// from costing the next request more than it gains: a conversation over
+// MaxIdleSaveTokens is left to the yield save at the switch, and a queue that is
+// not empty means a request is already waiting for the save lock.
 func (c *cache) idleSave(seq uint64) {
 	defer func() {
 		if v := recover(); v != nil {
@@ -565,15 +602,24 @@ func (c *cache) idleSave(seq uint64) {
 	defer c.saveMu.Unlock()
 	c.mu.Lock()
 	r, live, fp, est := c.cur, c.cur.live, c.cur.fp, c.cur.liveTokens
+	queued := c.queued
 	quiet := c.seq == seq && c.inflight == 0 && live != nil && fp != "" && c.ctx.Err() == nil
 	c.mu.Unlock()
 	if !quiet {
+		return
+	}
+	if queued > 0 {
+		c.skip("queue_busy", est)
 		return
 	}
 	if st, err := r.eng.Status(c.ctx); err == nil && !c.restarted(r, st) {
 		tokens := st.LiveTokens
 		if tokens < est {
 			tokens = est // the router reports none: keep the estimate
+		}
+		if c.pol.MaxIdleSaveTokens > 0 && tokens > c.pol.MaxIdleSaveTokens {
+			c.skip("idle_too_long", tokens)
+			return
 		}
 		c.save(c.ctx, r, fp, live, tokens, "idle")
 	}

@@ -472,7 +472,9 @@ func TestLlamaFingerprintIgnoresThePort(t *testing.T) {
 	if first != second {
 		t.Errorf("a reload on a new port read as a new engine: %s vs %s", first, second)
 	}
-	m.update(func(m *llamaMock) { m.models[0].args = []string{"/models/swift.gguf", "--port", "54001", "--ctx-size", "131072"} })
+	m.update(func(m *llamaMock) {
+		m.models[0].args = []string{"/models/swift.gguf", "--port", "54001", "--ctx-size", "131072"}
+	})
 	if third, err := e.Fingerprint(context.Background()); err != nil || third == first {
 		t.Errorf("a context change must change the fingerprint, got %s vs %s (err %v)", third, first, err)
 	}

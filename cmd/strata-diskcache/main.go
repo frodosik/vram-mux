@@ -69,6 +69,7 @@ type config struct {
 	ParkMinTokens         int     `env:"PARK_MIN_TOKENS" default:"-1" help:"Strata's --conversation-cache-min-tokens. -1 reads it from Strata."`
 	RegrowTokens          int     `env:"REGROW_TOKENS" default:"4096" help:"Save a conversation again once it has grown this much past its file."`
 	IdleSaveS             float64 `name:"idle-save-s" env:"IDLE_SAVE_S" default:"3" help:"Quiet seconds after a turn before it is saved. 0: save only when a switch would lose it."`
+	MaxIdleSaveTokens     int     `name:"max-idle-save-tokens" env:"MAX_IDLE_SAVE_TOKENS" default:"32768" help:"Skip a background idle save of a conversation longer than this: a 100K-token session writes 1.4 GB in ~110 s and holds the save lock, so a queued request waits for it. The yield save at a switch writes the same file in ~4 s. 0: no cap."`
 	SnapshotBytesPerToken int64   `env:"SNAPSHOT_BYTES_PER_TOKEN" default:"65536" help:"RAM per token of a parked conversation, to predict when Strata will refuse to park one."`
 	MaxBodyMiB            int64   `name:"max-body-mib" env:"MAX_BODY_MIB" default:"64" help:"Generation request bodies larger than this are streamed through without caching."`
 	ShutdownS             float64 `name:"shutdown-s" env:"SHUTDOWN_S" default:"20" help:"On SIGTERM, how long running requests and a save under way get to finish."`
@@ -107,7 +108,7 @@ func (c *config) Validate() error {
 		return err
 	}
 	if c.MaxGiB <= 0 || c.RetentionDays <= 0 || c.MinTokens < 1 || c.SnapshotBytesPerToken <= 0 || c.MaxBodyMiB < 1 ||
-		c.ShutdownS <= 0 || c.MinFreeMiB < 0 || c.IdleSaveS < 0 || c.RegrowTokens < 0 || c.Log.MaxSizeMiB < 1 ||
+		c.ShutdownS <= 0 || c.MinFreeMiB < 0 || c.IdleSaveS < 0 || c.MaxIdleSaveTokens < 0 || c.RegrowTokens < 0 || c.Log.MaxSizeMiB < 1 ||
 		c.VRAMMarginMiB < 0 || c.VRAMPollS <= 0 || c.DrainWaitS <= 0 || c.LoadTimeoutS <= 0 || c.BodyDivisor < 0 || c.MaxResidentStreak < 0 {
 		return errors.New("sizes, limits and timeouts must be positive (--min-free-mib, --idle-save-s, --regrow-tokens, --max-resident-streak, --vram-margin-mib and --body-divisor may be 0)")
 	}
@@ -300,6 +301,10 @@ func serve(ctx context.Context, cfg *config, log *slog.Logger, proxyL, adminL ne
 		VRAMMargin:        cfg.VRAMMarginMiB << 20,
 		VRAMFree:          engine.FreeVRAM,
 		PollInterval:      time.Duration(cfg.VRAMPollS * float64(time.Second)),
+		// The routes are strict: a request must name one of the models that were
+		// configured. Without --route flags the single route built from --upstream
+		// answers every request, and the proxy logs the model each one asked for.
+		Strict: len(cfg.Routes) > 0,
 		// The Strata route owns the card at startup: a --lazy server takes its model
 		// on the first request, so the arbiter must not load it and must not read the
 		// engine as idle. The strata route is always routes[0].
@@ -309,8 +314,8 @@ func serve(ctx context.Context, cfg *config, log *slog.Logger, proxyL, adminL ne
 	})
 	p := proxy.New(proxy.Options{Arbiter: arb, Store: st, MaxBody: cfg.MaxBodyMiB << 20, Metrics: m, Log: log,
 		Policy: proxy.Policy{MinTokens: cfg.MinTokens, ParkMinTokens: cfg.ParkMinTokens, RegrowTokens: cfg.RegrowTokens,
-			IdleDelay: time.Duration(cfg.IdleSaveS * float64(time.Second)), SnapshotBytesPerToken: cfg.SnapshotBytesPerToken,
-			BodyDivisor: cfg.BodyDivisor}})
+			IdleDelay: time.Duration(cfg.IdleSaveS * float64(time.Second)), MaxIdleSaveTokens: cfg.MaxIdleSaveTokens,
+			SnapshotBytesPerToken: cfg.SnapshotBytesPerToken, BodyDivisor: cfg.BodyDivisor}})
 
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
