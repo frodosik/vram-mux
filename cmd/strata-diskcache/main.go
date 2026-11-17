@@ -14,6 +14,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -24,6 +26,8 @@ import (
 	"golang.org/x/sync/errgroup"
 	"gopkg.in/natefinch/lumberjack.v2"
 
+	"github.com/tfyl/strata-diskcache/internal/arbiter"
+	"github.com/tfyl/strata-diskcache/internal/engine"
 	"github.com/tfyl/strata-diskcache/internal/proxy"
 	"github.com/tfyl/strata-diskcache/internal/store"
 )
@@ -51,6 +55,20 @@ type config struct {
 	MaxBodyMiB            int64   `name:"max-body-mib" env:"MAX_BODY_MIB" default:"64" help:"Generation request bodies larger than this are streamed through without caching."`
 	ShutdownS             float64 `name:"shutdown-s" env:"SHUTDOWN_S" default:"20" help:"On SIGTERM, how long running requests and a save under way get to finish."`
 
+	StrataModel   string `name:"strata-model" env:"STRATA_MODEL" default:"qwen3.8-flash-next-iq2_xs" help:"The model the Strata route answers for."`
+	StrataAPIKey  string `name:"strata-api-key" env:"STRATA_API_KEY" help:"Bearer token Strata needs, if any."`
+	StrataNeedMiB int64  `name:"strata-need-mib" env:"STRATA_NEED_MIB" default:"0" help:"VRAM the Strata route needs, for the free-memory gate. 0: gate on the margin only."`
+
+	Routes []string `name:"route" env:"ROUTES" sep:" " help:"One route per occurrence: dialect|id|model|base|api-key|need-mib. Example: llama|llama/Swift-27B|qwen3.8-swift-1.5-architect|http://127.0.0.1:8001|secret|18000"`
+
+	MaxResidentStreak int     `name:"max-resident-streak" env:"MAX_RESIDENT_STREAK" default:"32" help:"Requests of the resident route drained before a waiter may take the card. 0: unbounded."`
+	VRAMMarginMiB     int64   `name:"vram-margin-mib" env:"VRAM_MARGIN_MIB" default:"1024" help:"Bytes that must stay free on the card before a route is loaded."`
+	DrainWaitS        float64 `name:"drain-wait-s" env:"DRAIN_WAIT_S" default:"300" help:"How long a yield waits for a running turn to finish."`
+	LoadTimeoutS      float64 `name:"load-timeout-s" env:"LOAD_TIMEOUT_S" default:"600" help:"The whole swap: drain, free-VRAM gate, load."`
+	VRAMSysfs         string  `name:"vram-sysfs" env:"VRAM_SYSFS" default:"/sys/class/drm/card0/device" help:"The amdgpu device node the free-VRAM gate reads."`
+	VRAMPollS         float64 `name:"vram-poll-s" env:"VRAM_POLL_S" default:"2" help:"How often the free-VRAM gate re-reads the card while it waits for a load."`
+	BodyDivisor       int     `name:"body-divisor" env:"BODY_DIVISOR" default:"4" help:"Request bytes per token, the estimate for an engine that reports no token count. 0: never estimate."`
+
 	Log struct {
 		Output     string `env:"OUTPUT" enum:"stderr,file,both" default:"stderr" help:"Where logs go: stderr, file or both."`
 		File       string `env:"FILE" default:"/var/log/strata-diskcache/strata-diskcache.log" help:"Log file, for file and both."`
@@ -67,14 +85,94 @@ type config struct {
 
 // Validate is called by kong after parsing.
 func (c *config) Validate() error {
-	if u, err := url.Parse(c.Upstream); err != nil || u.Scheme == "" || u.Host == "" {
-		return errors.New("--upstream must be a URL like http://127.0.0.1:8081")
+	if _, err := c.routes(); err != nil {
+		return err
 	}
 	if c.MaxGiB <= 0 || c.RetentionDays <= 0 || c.MinTokens < 1 || c.SnapshotBytesPerToken <= 0 || c.MaxBodyMiB < 1 ||
-		c.ShutdownS <= 0 || c.MinFreeMiB < 0 || c.IdleSaveS < 0 || c.RegrowTokens < 0 || c.Log.MaxSizeMiB < 1 {
-		return errors.New("sizes, limits and timeouts must be positive (--min-free-mib, --idle-save-s and --regrow-tokens may be 0)")
+		c.ShutdownS <= 0 || c.MinFreeMiB < 0 || c.IdleSaveS < 0 || c.RegrowTokens < 0 || c.Log.MaxSizeMiB < 1 ||
+		c.VRAMMarginMiB < 0 || c.VRAMPollS <= 0 || c.DrainWaitS <= 0 || c.LoadTimeoutS <= 0 || c.BodyDivisor < 0 || c.MaxResidentStreak < 0 {
+		return errors.New("sizes, limits and timeouts must be positive (--min-free-mib, --idle-save-s, --regrow-tokens, --max-resident-streak, --vram-margin-mib and --body-divisor may be 0)")
 	}
 	return nil
+}
+
+// resolveKey turns an api-key field into the bearer token to send. "file:PATH"
+// reads the first line of that file at startup, so the key never sits in the
+// process arguments where `ps` shows it; a plain value is used as it is.
+func resolveKey(spec string) (string, error) {
+	if !strings.HasPrefix(spec, "file:") {
+		return spec, nil
+	}
+	path := strings.TrimPrefix(spec, "file:")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("api-key file %q: %w", path, err)
+	}
+	line := strings.SplitN(strings.TrimSpace(string(b)), "\n", 2)[0]
+	if line == "" {
+		return "", fmt.Errorf("api-key file %q is empty", path)
+	}
+	return line, nil
+}
+
+// routes is the arbiter's route list: the Strata route first (the resident a
+// request that names no model goes to), then each --route in order.
+func (c *config) routes() ([]arbiter.Route, error) {
+	strataKey, err := resolveKey(c.StrataAPIKey)
+	if err != nil {
+		return nil, err
+	}
+	out := []arbiter.Route{{
+		ID:        "strata/" + c.StrataModel,
+		Dialect:   "strata",
+		Model:     c.StrataModel,
+		Base:      c.Upstream,
+		APIKey:    strataKey,
+		Need:      c.StrataNeedMiB << 20,
+		Namespace: store.NamespaceOf("strata", c.StrataModel),
+	}}
+	for _, spec := range c.Routes {
+		f := strings.Split(spec, "|")
+		if len(f) != 6 {
+			return nil, fmt.Errorf("--route needs dialect|id|model|base|api-key|need-mib, got %q", spec)
+		}
+		if f[0] != "strata" && f[0] != "llama" {
+			return nil, fmt.Errorf("--route dialect must be strata or llama, got %q", f[0])
+		}
+		need, err := strconv.ParseInt(f[5], 10, 64)
+		if err != nil || need < 0 {
+			return nil, fmt.Errorf("--route need-mib must be a whole number of MiB, got %q", f[5])
+		}
+		if f[1] == "" || f[2] == "" || f[3] == "" {
+			return nil, fmt.Errorf("--route needs an id, a model and a base URL: %q", spec)
+		}
+		for _, r := range out {
+			if r.ID == f[1] {
+				return nil, fmt.Errorf("--route id %q is used twice", f[1])
+			}
+		}
+		key, err := resolveKey(f[4])
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, arbiter.Route{
+			ID: f[1], Dialect: f[0], Model: f[2], Base: f[3], APIKey: key,
+			Need: need << 20, Namespace: store.NamespaceOf(f[0], f[2]),
+		})
+	}
+	for i, r := range out {
+		u, err := url.Parse(r.Base)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return nil, fmt.Errorf("route %q: base must be a URL like http://127.0.0.1:8001", r.ID)
+		}
+		switch r.Dialect {
+		case "strata":
+			out[i].Engine = engine.NewStrata(engine.Options{ID: r.ID, Model: r.Model, Base: r.Base, APIKey: r.APIKey})
+		case "llama":
+			out[i].Engine = engine.NewLlama(engine.Options{ID: r.ID, Model: r.Model, Base: r.Base, APIKey: r.APIKey})
+		}
+	}
+	return out, nil
 }
 
 func parse(args []string) (*config, error) {
@@ -150,7 +248,7 @@ func run() error {
 // serve runs the proxy and the admin server on the listeners until ctx ends,
 // then gives running requests and a save under way --shutdown-s to finish.
 func serve(ctx context.Context, cfg *config, log *slog.Logger, proxyL, adminL net.Listener) error {
-	upstream, _ := url.Parse(cfg.Upstream)
+
 	maxBytes := int64(cfg.MaxGiB * (1 << 30))
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
@@ -169,14 +267,37 @@ func serve(ctx context.Context, cfg *config, log *slog.Logger, proxyL, adminL ne
 			log.Info("disk cache", "dir", cfg.SessionDir, "max_gib", cfg.MaxGiB, "retention_days", cfg.RetentionDays, "files", n)
 		}
 	}
-	p := proxy.New(proxy.Options{Upstream: upstream, Store: st, MaxBody: cfg.MaxBodyMiB << 20, Metrics: m, Log: log,
+	engine.SysfsVRAM = cfg.VRAMSysfs // the card the free-VRAM gate reads
+	routes, err := cfg.routes()
+	if err != nil {
+		return err
+	}
+	arb := arbiter.New(arbiter.Options{
+		Routes:            routes,
+		MaxResidentStreak: cfg.MaxResidentStreak,
+		DrainWait:         time.Duration(cfg.DrainWaitS * float64(time.Second)),
+		LoadTimeout:       time.Duration(cfg.LoadTimeoutS * float64(time.Second)),
+		VRAMMargin:        cfg.VRAMMarginMiB << 20,
+		VRAMFree:          engine.FreeVRAM,
+		PollInterval:      time.Duration(cfg.VRAMPollS * float64(time.Second)),
+		// The Strata route owns the card at startup: a --lazy server takes its model
+		// on the first request, so the arbiter must not load it and must not read the
+		// engine as idle. The strata route is always routes[0].
+		InitialResident: routes[0].ID,
+		Log:             log,
+		Observers:       m,
+	})
+	p := proxy.New(proxy.Options{Arbiter: arb, Store: st, MaxBody: cfg.MaxBodyMiB << 20, Metrics: m, Log: log,
 		Policy: proxy.Policy{MinTokens: cfg.MinTokens, ParkMinTokens: cfg.ParkMinTokens, RegrowTokens: cfg.RegrowTokens,
-			IdleDelay: time.Duration(cfg.IdleSaveS * float64(time.Second)), SnapshotBytesPerToken: cfg.SnapshotBytesPerToken}})
+			IdleDelay: time.Duration(cfg.IdleSaveS * float64(time.Second)), SnapshotBytesPerToken: cfg.SnapshotBytesPerToken,
+			BodyDivisor: cfg.BodyDivisor}})
 
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 	mux.HandleFunc("GET /requests", p.Requests)
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok\n") })
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok resident="+p.Resident()+"\n")
+	})
 	srv := &http.Server{Handler: p, ReadHeaderTimeout: 30 * time.Second}
 	admin := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 

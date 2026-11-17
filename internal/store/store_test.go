@@ -12,9 +12,12 @@ import (
 
 const fp = "0123456789ab"
 
+// ns is a route namespace, the 12-hex prefix a (backend, model) route carries.
+const ns = "111111111111"
+
 func key(i int) string { return fmt.Sprintf("%064x", i) }
 
-func name(i, tokens int) string { return FileName(fp, key(i), tokens) }
+func name(i, tokens int) string { return FileName(ns, fp, key(i), tokens) }
 
 func write(t *testing.T, dir, name string, size int, mtime time.Time) {
 	t.Helper()
@@ -67,16 +70,98 @@ func TestLoadCleansUp(t *testing.T) {
 	}
 }
 
-func TestFingerprint(t *testing.T) {
-	s, dir, evicted := newStore(t, 1000, 1<<40)
-	write(t, dir, name(1, 20000), 10, time.Now())
-	write(t, dir, FileName("ffffffffffff", key(2), 20000), 10, time.Now())
+func TestLoadIndexesLegacyNames(t *testing.T) {
+	s, dir, _ := newStore(t, 1<<30, 1<<40)
+	now := time.Now()
+	write(t, dir, FileName("", fp, key(1), 20000), 10, now)
+	write(t, dir, FileName(ns, fp, key(2), 20000), 10, now)
 	if err := s.Load(); err != nil {
 		t.Fatal(err)
 	}
-	s.KeepFingerprint(fp)
-	if !exists(dir, name(1, 20000)) || exists(dir, FileName("ffffffffffff", key(2), 20000)) || evicted["fingerprint"] != 1 {
+	if n, bytes := s.Stats(); n != 2 || bytes != 20 {
+		t.Errorf("legacy and namespaced files: %d files %d bytes, want 2 20", n, bytes)
+	}
+	if _, ok := s.Lookup("", fp, []string{key(1)}); !ok {
+		t.Error("the legacy file is not found in the legacy namespace")
+	}
+	if _, ok := s.Lookup(ns, fp, []string{key(2)}); !ok {
+		t.Error("the namespaced file is not found in its namespace")
+	}
+}
+
+func TestKeepFingerprintIsScopedPerRoute(t *testing.T) {
+	s, dir, evicted := newStore(t, 1<<30, 1<<40)
+	now := time.Now()
+	strata, llama := NamespaceOf("strata", "flash-next"), NamespaceOf("llama", "swift-27b")
+	write(t, dir, FileName(strata, fp, key(1), 20000), 10, now)
+	write(t, dir, FileName(strata, "ffffffffffff", key(2), 20000), 10, now)
+	write(t, dir, FileName(llama, "eeeeeeeeeeee", key(3), 20000), 10, now)
+	if err := s.Load(); err != nil {
+		t.Fatal(err)
+	}
+	// The 27B parent learns its own fingerprint: only its route's stale files go.
+	s.KeepFingerprint(llama, "eeeeeeeeeeee")
+	if !exists(dir, FileName(strata, fp, key(1), 20000)) || !exists(dir, FileName(strata, "ffffffffffff", key(2), 20000)) {
+		t.Error("learning the 27B fingerprint evicted flash-next's sessions")
+	}
+	if evicted["fingerprint"] != 0 {
+		t.Errorf("nothing of llama's route was evicted: %v", evicted)
+	}
+	// Its route's other fingerprints go, and only those.
+	s.KeepFingerprint(llama, "dddddddddddd")
+	if !exists(dir, FileName(strata, fp, key(1), 20000)) || exists(dir, FileName(llama, "eeeeeeeeeeee", key(3), 20000)) {
 		t.Errorf("KeepFingerprint kept the wrong files: %v", evicted)
+	}
+}
+
+func TestAdoptMovesLegacyFilesIntoTheirRoute(t *testing.T) {
+	s, dir, _ := newStore(t, 1<<30, 1<<40)
+	now := time.Now()
+	strata := NamespaceOf("strata", "flash-next")
+	write(t, dir, FileName("", fp, key(1), 20000), 10, now)
+	write(t, dir, FileName("", "ffffffffffff", key(2), 20000), 10, now)
+	write(t, dir, FileName(NamespaceOf("llama", "swift-27b"), "dddddddddddd", key(3), 20000), 10, now)
+	if err := s.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if n := s.Adopt(strata, fp); n != 1 {
+		t.Fatalf("Adopt moved %d files, want 1", n)
+	}
+	if exists(dir, FileName("", fp, key(1), 20000)) {
+		t.Error("the legacy file is still under its old name")
+	}
+	moved := FileName(strata, fp, key(1), 20000)
+	if !exists(dir, moved) {
+		t.Fatalf("%s is gone", moved)
+	}
+	if _, ok := s.Lookup(strata, fp, []string{key(1)}); !ok {
+		t.Error("the adopted file is not found in its namespace")
+	}
+	if _, ok := s.Lookup("", fp, []string{key(1)}); ok {
+		t.Error("the adopted file is still found under the legacy namespace")
+	}
+	if _, ok := s.Lookup("", "ffffffffffff", []string{key(2)}); !ok {
+		t.Error("Adopt took a legacy file of another fingerprint")
+	}
+}
+
+func TestCapIsGlobalAcrossRoutes(t *testing.T) {
+	s, dir, _ := newStore(t, 250, 1<<40)
+	now := time.Now()
+	strata, llama := NamespaceOf("strata", "flash-next"), NamespaceOf("llama", "swift-27b")
+	for i := 1; i <= 4; i++ { // 1 is the least recently used, across both routes
+		nsOf := strata
+		if i%2 == 0 {
+			nsOf = llama
+		}
+		write(t, dir, FileName(nsOf, fp, key(i), 20000), 100, now.Add(time.Duration(i-10)*time.Minute))
+	}
+	if err := s.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(dir, FileName(strata, fp, key(3), 20000)) || !exists(dir, FileName(llama, fp, key(4), 20000)) ||
+		exists(dir, FileName(strata, fp, key(2), 20000)) {
+		t.Fatal("the cap kept the wrong files across routes")
 	}
 }
 
@@ -92,7 +177,7 @@ func TestCapAndLRU(t *testing.T) {
 	if !exists(dir, name(3, 20000)) || !exists(dir, name(4, 20000)) || exists(dir, name(2, 20000)) {
 		t.Fatal("the cap kept the wrong files")
 	}
-	s.Touch(Entry{Fingerprint: fp, Key: key(3), Tokens: 20000}) // 3 is now the most recent
+	s.Touch(Entry{Namespace: ns, Fingerprint: fp, Key: key(3), Tokens: 20000}) // 3 is now the most recent
 	if !s.Reserve(100) || exists(dir, name(4, 20000)) || !exists(dir, name(3, 20000)) {
 		t.Fatal("Reserve evicted the wrong file")
 	}
@@ -129,34 +214,38 @@ func TestDiskFloorWins(t *testing.T) {
 
 func TestAnyFingerprint(t *testing.T) {
 	s, dir, _ := newStore(t, 1<<30, 1<<40)
-	if s.AnyFingerprint() != "" {
+	if s.AnyFingerprint(ns) != "" {
 		t.Error("an empty store gave a fingerprint")
 	}
 	now := time.Now()
-	write(t, dir, FileName("aaaaaaaaaaaa", key(1), 20000), 10, now.Add(-2*time.Hour))
-	write(t, dir, FileName(fp, key(2), 20000), 10, now.Add(-time.Hour))
+	write(t, dir, FileName(ns, "aaaaaaaaaaaa", key(1), 20000), 10, now.Add(-2*time.Hour))
+	write(t, dir, FileName(ns, fp, key(2), 20000), 10, now.Add(-time.Hour))
+	write(t, dir, FileName("222222222222", fp, key(3), 20000), 10, now) // another route, the newest
 	if err := s.Load(); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.AnyFingerprint(); got != fp {
-		t.Errorf("AnyFingerprint = %q, want the most recently used file's", got)
+	if got := s.AnyFingerprint(ns); got != fp {
+		t.Errorf("AnyFingerprint = %q, want the most recently used file of this route", got)
 	}
-	s.Touch(Entry{Fingerprint: "aaaaaaaaaaaa", Key: key(1), Tokens: 20000})
-	if got := s.AnyFingerprint(); got != "aaaaaaaaaaaa" {
+	s.Touch(Entry{Namespace: ns, Fingerprint: "aaaaaaaaaaaa", Key: key(1), Tokens: 20000})
+	if got := s.AnyFingerprint(ns); got != "aaaaaaaaaaaa" {
 		t.Errorf("After a Touch, AnyFingerprint = %q, want the file just used", got)
+	}
+	if got := s.AnyFingerprint("222222222222"); got != fp {
+		t.Errorf("the other route's AnyFingerprint = %q, want %q", got, fp)
 	}
 }
 
 func TestAnyFingerprintTie(t *testing.T) {
 	s, dir, _ := newStore(t, 1<<30, 1<<40)
 	now := time.Now()
-	write(t, dir, FileName("aaaaaaaaaaaa", key(1), 20000), 10, now)
-	write(t, dir, FileName("bbbbbbbbbbbb", key(2), 20000), 10, now)
+	write(t, dir, FileName(ns, "aaaaaaaaaaaa", key(1), 20000), 10, now)
+	write(t, dir, FileName(ns, "bbbbbbbbbbbb", key(2), 20000), 10, now)
 	if err := s.Load(); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 20; i++ { // map order is randomised: the tie must break the same way
-		if got := s.AnyFingerprint(); got != "bbbbbbbbbbbb" {
+		if got := s.AnyFingerprint(ns); got != "bbbbbbbbbbbb" {
 			t.Fatalf("AnyFingerprint = %q, want the higher file name for the same mtime", got)
 		}
 	}
@@ -169,36 +258,77 @@ func TestCommitLookupAndCorruptFiles(t *testing.T) {
 	t3 := []string{key(1), key(2), key(3), key(4), key(5)}
 
 	write(t, dir, name(1, 20000), 10, time.Now())
-	if _, err := s.Commit(fp, t1, 20000, 20000); err != nil {
+	if _, err := s.Commit(ns, fp, t1, 20000, 20000); err != nil {
 		t.Fatal(err)
 	}
-	if e, ok := s.Lookup(fp, t3); !ok || e.Key != key(1) {
+	if e, ok := s.Lookup(ns, fp, t3); !ok || e.Key != key(1) {
 		t.Fatal("turn 3 does not find turn 1's file")
 	}
-	if _, ok := s.Lookup("ffffffffffff", t3); ok {
+	if _, ok := s.Lookup(ns, "ffffffffffff", t3); ok {
 		t.Error("found under another fingerprint")
 	}
-	if !s.Covered(fp, t2, 20000) || s.Covered(fp, t2, 20001) {
+	if _, ok := s.Lookup("222222222222", fp, t3); ok {
+		t.Error("found in another route's namespace")
+	}
+	if !s.Covered(ns, fp, t2, 20000) || s.Covered(ns, fp, t2, 20001) {
 		t.Error("Covered is wrong")
 	}
 
-	// Strata counted 30123 tokens where 30000 were planned: renamed, and turn 1's file superseded
+	// The engine counted 30123 tokens where 30000 were planned: renamed, and turn 1's file superseded
 	write(t, dir, name(3, 30000), 10, time.Now())
-	if e, err := s.Commit(fp, t2, 30000, 30123); err != nil || e.Tokens != 30123 || !exists(dir, name(3, 30123)) {
+	if e, err := s.Commit(ns, fp, t2, 30000, 30123); err != nil || e.Tokens != 30123 || !exists(dir, name(3, 30123)) {
 		t.Fatalf("commit with another count: %+v %v", e, err)
 	}
 	if exists(dir, name(1, 20000)) {
 		t.Error("turn 1's file not superseded")
 	}
-	if _, err := s.Commit(fp, t3, 1, 1); err == nil {
-		t.Error("committed a file Strata did not write")
+	if _, err := s.Commit(ns, fp, t3, 1, 1); err == nil {
+		t.Error("committed a file the engine did not write")
 	}
 
 	// truncated behind our back: dropped on lookup
 	if err := os.Truncate(filepath.Join(dir, name(3, 30123)), 5); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := s.Lookup(fp, t3); ok || exists(dir, name(3, 30123)) {
+	if _, ok := s.Lookup(ns, fp, t3); ok || exists(dir, name(3, 30123)) {
 		t.Error("a changed file was restored")
+	}
+}
+
+// The startup case: the folder is full of legacy unprefixed files from the
+// single-route build, and the first save of a namespaced route has to count them
+// against the global cap. Legacy files are in the LRU like any other, so the
+// least recently used go first, and the disk pressure the owner worried about
+// does not appear: the save is admitted after the prune, not refused.
+func TestLegacyFilesCountAgainstTheGlobalCap(t *testing.T) {
+	s, dir, _ := newStore(t, 300, 1<<40)
+	now := time.Now()
+	strata := NamespaceOf("strata", "flash-next")
+	for i := 1; i <= 3; i++ { // legacy 3-group names, oldest first
+		write(t, dir, FileName("", fp, key(i), 20000), 100, now.Add(time.Duration(i-30)*time.Minute))
+	}
+	if err := s.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if n, bytes := s.Stats(); n != 3 || bytes != 300 {
+		t.Fatalf("startup: %d files %d bytes, want 3 300", n, bytes)
+	}
+	if !s.Reserve(250) {
+		t.Fatal("the first prefixed save was refused")
+	}
+	write(t, dir, FileName(strata, fp, key(4), 250), 250, now)
+	if _, err := s.Commit(strata, fp, []string{key(4)}, 250, 250); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 3; i++ {
+		if exists(dir, FileName("", fp, key(i), 20000)) {
+			t.Errorf("legacy file %d survived the cap", i)
+		}
+	}
+	if !exists(dir, FileName(strata, fp, key(4), 250)) {
+		t.Error("the prefixed save is not on disk")
+	}
+	if n, bytes := s.Stats(); n != 1 || bytes != 250 {
+		t.Errorf("after the save: %d files %d bytes, want 1 250", n, bytes)
 	}
 }

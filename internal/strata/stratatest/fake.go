@@ -19,28 +19,32 @@ import (
 type Fake struct {
 	Dir string // the slot_save_path
 
-	mu          sync.Mutex
-	Tokens      int // last_timings total
-	Parked      int
-	Started     int64
-	Loaded      bool
-	Model       string
-	BudgetMiB   int64
-	MinTokens   int
-	SlotStatus  int           // non-zero: slot calls answer this status
-	SlotKind    string        // with this kind
-	SlotMessage string        // with this message ("refused" when empty)
-	SlotDelay   time.Duration // save/restore take this long
-	GenDelay    time.Duration // a pause after the first event
-	TailDelay   time.Duration // a pause after the answer is complete
-	Finish      string        // a last chunk carrying this finish_reason
-	Content     string        // the first delta carries this answer text
-	GenStatus   int           // non-zero: generation requests answer this status
-	Unloaded    bool          // engine unloaded: no /metrics fingerprint, slot calls refused
-	Down        bool          // every request answers 503
-	actions     []string      // "save NAME", "restore NAME", "gen PATH", "other METHOD PATH"
-	Bodies      []string      // the bodies of generation requests, in order
-	entered     chan string   // when set, each slot call reports itself here first
+	mu           sync.Mutex
+	Tokens       int // last_timings total
+	Parked       int
+	Started      int64
+	Loaded       bool
+	Model        string
+	BudgetMiB    int64
+	MinTokens    int
+	SlotStatus   int           // non-zero: slot calls answer this status
+	SlotKind     string        // with this kind
+	SlotMessage  string        // with this message ("refused" when empty)
+	SlotDelay    time.Duration // save/restore take this long
+	LoadDelay    time.Duration // /v1/load takes this long
+	UnloadDelay  time.Duration // /v1/unload takes this long
+	LoadStatus   int           // non-zero: /v1/load answers this status
+	UnloadStatus int           // non-zero: /v1/unload answers this status
+	GenDelay     time.Duration // a pause after the first event
+	TailDelay    time.Duration // a pause after the answer is complete
+	Finish       string        // a last chunk carrying this finish_reason
+	Content      string        // the first delta carries this answer text
+	GenStatus    int           // non-zero: generation requests answer this status
+	Unloaded     bool          // engine unloaded: no /metrics fingerprint, slot calls refused
+	Down         bool          // every request answers 503
+	actions      []string      // "save NAME", "restore NAME", "gen PATH", "other METHOD PATH"
+	Bodies       []string      // the bodies of generation requests, in order
+	entered      chan string   // when set, each slot call reports itself here first
 }
 
 // New returns a fake with a 3.5 GiB, 4-slot RAM cache that parks
@@ -106,6 +110,8 @@ func (f *Fake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.mu.Unlock()
 	case strings.HasPrefix(r.URL.Path, "/slots/0"):
 		f.slot(w, r) // unlocks
+	case r.URL.Path == "/v1/load", r.URL.Path == "/v1/unload":
+		f.control(w, r) // unlocks
 	case r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/responses":
 		f.gen(w, r) // unlocks
 	default:
@@ -113,6 +119,44 @@ func (f *Fake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.mu.Unlock()
 		fmt.Fprintf(w, "host=%s path=%s", r.Host, r.URL.Path)
 	}
+}
+
+// control is the arbiter's end of the handoff: /v1/load makes the engine
+// resident, /v1/unload gives the VRAM back and keeps the server alive.
+func (f *Fake) control(w http.ResponseWriter, r *http.Request) {
+	load := r.URL.Path == "/v1/load"
+	if load {
+		f.actions = append(f.actions, "load")
+	} else {
+		f.actions = append(f.actions, "unload "+r.URL.Query().Get("wait"))
+	}
+	status, delay := f.LoadStatus, f.LoadDelay
+	if !load {
+		status, delay = f.UnloadStatus, f.UnloadDelay
+	}
+	f.mu.Unlock()
+	time.Sleep(delay)
+	if status != 0 {
+		w.WriteHeader(status)
+		fmt.Fprint(w, `{"error":{"message":"refused"}}`)
+		return
+	}
+	if load {
+		f.mu.Lock()
+		f.Unloaded, f.Loaded = false, true
+		f.mu.Unlock()
+		fmt.Fprint(w, `{"status":"loaded"}`)
+		return
+	}
+	f.mu.Lock()
+	notLoaded := f.Unloaded
+	f.Unloaded, f.Loaded = true, false
+	f.mu.Unlock()
+	if notLoaded {
+		fmt.Fprint(w, `{"status":"not loaded"}`)
+		return
+	}
+	fmt.Fprint(w, `{"status":"unloaded"}`)
 }
 
 func (f *Fake) slot(w http.ResponseWriter, r *http.Request) {

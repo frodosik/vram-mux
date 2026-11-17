@@ -14,6 +14,11 @@ type Metrics struct {
 	saves, restores, savedBytes, restoredBytes, panics            prometheus.Counter
 	saveSeconds, restoreSeconds                                   prometheus.Histogram
 	lastSave, lastRestore                                         prometheus.Gauge
+	swaps, prefillTokens                                          prometheus.Counter
+	swapSeconds                                                   prometheus.Histogram
+	swapBlocked                                                   *prometheus.CounterVec
+	queue                                                         prometheus.Gauge
+	resident                                                      *prometheus.GaugeVec
 }
 
 // NewMetrics registers the metrics with reg.
@@ -35,7 +40,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		requests:       vec("requests_total", "Generation requests by what the cache did.", "action"),
 		savesBy:        vec("saves_by_trigger_total", "Session files saved, by trigger.", "trigger"),
 		skipped:        vec("saves_skipped_total", "Saves not made, by reason.", "reason"),
-		failures:       vec("failures_total", "Saves and restores Strata refused or failed.", "op", "reason"),
+		failures:       vec("failures_total", "Saves and restores the engine refused or failed.", "op", "reason"),
 		evictions:      vec("evictions_total", "Session files deleted, by reason.", "reason"),
 		evictedBytes:   vec("evicted_bytes_total", "Bytes of session files deleted, by reason.", "reason"),
 		saves:          counter("saves_total", "Session files saved."),
@@ -43,13 +48,21 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		savedBytes:     counter("saved_bytes_total", "Bytes written to session files."),
 		restoredBytes:  counter("restored_bytes_total", "Bytes read from session files."),
 		panics:         counter("panics_total", "Panics in the cache logic (the request went through)."),
+		swaps:          counter("swaps_total", "Times the card was given to another route."),
+		prefillTokens:  counter("re_prefill_tokens_total", "Tokens of requests that ran with no session to restore, an estimate of what a swap cost in re-prefill."),
 		saveSeconds:    hist("save_seconds", "Time to save a session file."),
 		restoreSeconds: hist("restore_seconds", "Time to restore a session file."),
-		lastSave:       prometheus.NewGauge(prometheus.GaugeOpts(opts("last_save_ms", "Duration of the last save."))),
-		lastRestore:    prometheus.NewGauge(prometheus.GaugeOpts(opts("last_restore_ms", "Duration of the last restore."))),
+		swapSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: "strata_diskcache", Name: "swap_seconds",
+			Help: "Time from the yield to the new route being resident.", Buckets: []float64{1, 3, 10, 30, 60, 120, 300, 600}}),
+		swapBlocked: vec("swap_blocked_total", "A swap that did not happen, by reason.", "reason"),
+		queue:       prometheus.NewGauge(prometheus.GaugeOpts(opts("queue_length", "Requests waiting for the card."))),
+		lastSave:    prometheus.NewGauge(prometheus.GaugeOpts(opts("last_save_ms", "Duration of the last save."))),
+		lastRestore: prometheus.NewGauge(prometheus.GaugeOpts(opts("last_restore_ms", "Duration of the last restore."))),
+		resident:    prometheus.NewGaugeVec(prometheus.GaugeOpts(opts("resident_route", "1 for the route holding the card.")), []string{"route"}),
 	}
 	reg.MustRegister(m.requests, m.savesBy, m.skipped, m.failures, m.evictions, m.evictedBytes, m.saves, m.restores,
-		m.savedBytes, m.restoredBytes, m.panics, m.saveSeconds, m.restoreSeconds, m.lastSave, m.lastRestore)
+		m.savedBytes, m.restoredBytes, m.panics, m.swaps, m.prefillTokens, m.saveSeconds, m.restoreSeconds, m.swapSeconds,
+		m.swapBlocked, m.queue, m.resident, m.lastSave, m.lastRestore)
 	return m
 }
 
@@ -84,4 +97,33 @@ func (m *Metrics) restored(bytes int64, d time.Duration) {
 	m.restoredBytes.Add(float64(bytes))
 	m.restoreSeconds.Observe(d.Seconds())
 	m.lastRestore.Set(float64(d.Milliseconds()))
+}
+
+// prefill counts a request that ran with nothing to restore: what a swap cost in
+// tokens the engine had to read again.
+func (m *Metrics) prefill(tokens int) {
+	m.prefillTokens.Add(float64(tokens))
+}
+
+// Swap is the arbiter's Observers.Swap.
+func (m *Metrics) Swap(from, to string, seconds float64) {
+	m.swaps.Inc()
+	m.swapSeconds.Observe(seconds)
+	m.resident.WithLabelValues(to).Set(1)
+	if from != "" {
+		m.resident.WithLabelValues(from).Set(0)
+	}
+}
+
+// SwapBlocked is the arbiter's Observers.SwapBlocked.
+func (m *Metrics) SwapBlocked(reason string) {
+	m.swapBlocked.WithLabelValues(reason).Inc()
+}
+
+// Queue is the arbiter's Observers.Queue.
+func (m *Metrics) Queue(n int, resident string) {
+	m.queue.Set(float64(n))
+	if resident != "" {
+		m.resident.WithLabelValues(resident).Set(1)
+	}
 }

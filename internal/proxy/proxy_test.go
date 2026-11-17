@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +18,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/tfyl/strata-diskcache/internal/arbiter"
+	"github.com/tfyl/strata-diskcache/internal/engine"
 	"github.com/tfyl/strata-diskcache/internal/store"
 	"github.com/tfyl/strata-diskcache/internal/strata/stratatest"
 )
@@ -48,27 +49,44 @@ type env struct {
 }
 
 // setup starts a fake Strata and the proxy in front of it. Idle saves are off
-// unless idle > 0.
+// unless idle > 0. One route, no VRAM gate: the single-engine cache behaves as
+// it did before the arbiter existed.
 func setup(t *testing.T, idle time.Duration, maxBody int64) *env {
 	t.Helper()
 	e := &env{t: t, dir: t.TempDir(), logs: &syncBuffer{}, avail: 8 << 30}
 	e.f = stratatest.New(e.dir)
 	up := httptest.NewServer(e.f)
 	t.Cleanup(up.Close)
-	u, _ := url.Parse(up.URL)
 	log := slog.New(slog.NewJSONHandler(e.logs, nil))
 	e.st = store.New(store.Options{Dir: e.dir, MaxBytes: 64 << 30, MaxAge: time.Hour, Log: log,
 		FreeSpace: func(string) (int64, error) { return 1 << 40, nil }})
 	if err := e.st.Load(); err != nil {
 		t.Fatal(err)
 	}
-	e.p = New(Options{Upstream: u, Store: e.st, MaxBody: maxBody, Metrics: NewMetrics(prometheus.NewRegistry()), Log: log,
-		Policy: Policy{MinTokens: 15000, ParkMinTokens: -1, RegrowTokens: 4096, IdleDelay: idle, SnapshotBytesPerToken: 64 << 10,
+	e.p = New(Options{Arbiter: oneRoute(up.URL, "test-model"), Store: e.st, MaxBody: maxBody,
+		Metrics: NewMetrics(prometheus.NewRegistry()), Log: log,
+		Policy: Policy{MinTokens: 15000, ParkMinTokens: -1, RegrowTokens: 4096, IdleDelay: idle,
+			SnapshotBytesPerToken: 64 << 10, BodyDivisor: 4,
 			MemAvailable: func() (int64, error) { e.mu.Lock(); defer e.mu.Unlock(); return e.avail, nil }}})
 	px := httptest.NewServer(e.p)
 	t.Cleanup(func() { px.Close(); _ = e.p.Close(context.Background()) })
 	e.url = px.URL
 	return e
+}
+
+// oneRoute is the arbiter over a single route, with no VRAM gate. The route is
+// resident from the start and its engine is left as it is: a --lazy Strata takes
+// its model on the first request, so the cache's cold-engine path stays reachable.
+func oneRoute(base, model string) *arbiter.Arbiter {
+	id := "strata/" + model
+	return arbiter.New(arbiter.Options{
+		Routes: []arbiter.Route{{ID: id, Dialect: "strata", Model: model, Base: base,
+			Namespace: store.NamespaceOf("strata", model),
+			Engine:    engine.NewStrata(engine.Options{ID: id, Model: model, Base: base})}},
+		InitialResident: id,
+		Log:             slog.New(slog.NewJSONHandler(io.Discard, nil)),
+		VRAMFree:        func() (int64, error) { return 1 << 40, nil },
+	})
 }
 
 func (e *env) setAvail(n int64) { e.mu.Lock(); e.avail = n; e.mu.Unlock() }
@@ -133,6 +151,16 @@ func (e *env) nameOf() string {
 func (e *env) exists(name string) bool {
 	_, err := os.Stat(filepath.Join(e.dir, name))
 	return err == nil
+}
+
+// restores counts the restore calls the fake saw.
+func restores(actions []string) (n int) {
+	for _, a := range actions {
+		if strings.HasPrefix(a, "restore ") {
+			n++
+		}
+	}
+	return n
 }
 
 func saves(actions []string) (n int) {
@@ -244,15 +272,27 @@ func TestOverlappingRequests(t *testing.T) {
 	go func() { s, _ := e.post(context.Background(), "/v1/chat/completions", conversation("A", 2)); done <- s }()
 	want(t, "slot call", <-entered, "restore")
 	e.f.Update(func(f *stratatest.Fake) { f.SlotDelay = 0 })
+	t0 := time.Now()
 	if s, _ := e.post(context.Background(), "/v1/chat/completions", conversation("B", 2)); s != 200 {
 		t.Fatalf("status %d", s)
 	}
-	want(t, "mid-restore", e.last(), actBusy)
+	// The card runs one request at a time: B waited for A's restore and then
+	// switched from disk on a settled cache, never mid-restore.
+	if time.Since(t0) < 300*time.Millisecond {
+		t.Error("the second request ran while the first's restore was under way")
+	}
+	want(t, "after the restore", e.last(), actDisk)
 	if s := <-done; s != 200 {
 		t.Fatalf("restored request: status %d", s)
 	}
-	if e.p.cache.live != nil {
-		t.Error("after overlapping requests the live conversation is still trusted")
+	// The restores are the ones the two requests asked for, once each; the saves
+	// that follow are the idle saves of the two turns, which is what the queue
+	// order is for.
+	if n := restores(e.f.Take()); n != 2 {
+		t.Errorf("restores: %d, want one per request", n)
+	}
+	if e.p.cache.routes["strata/test-model"].live == nil {
+		t.Error("the cache lost track of the conversation after the restore")
 	}
 
 	// the same conversation from four clients at once: all answered

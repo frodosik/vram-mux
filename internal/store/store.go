@@ -1,16 +1,28 @@
 // Package store indexes the session files the proxy owns and enforces their
 // limits: an age limit, a total size cap and a free-space floor.
 //
-// Files are named dc-<fingerprint>-<key>-<tokens>.session in Strata's
-// slot_save_path. The fingerprint names the Strata build, model and settings
-// that wrote the file; Strata refuses a file of another one, so those go. A
-// file's mtime is its last use (save or restore), for the LRU and the age
-// limit. Other files in the folder are never touched. Strata writes a file
-// under a temporary name and renames it into place, so a file under its final
-// name is complete; a leftover temporary (.dc-*.tmp) is from a save that died.
+// Files are named dc-<namespace>-<fingerprint>-<key>-<tokens>.session in the
+// shared session folder. The namespace names the (backend, model) identity that
+// owns the file: "llama/Swift-27B" and "strata/flash-next" share one folder, and
+// a file is only ever evicted by the fingerprint of its own namespace, so
+// learning one model's fingerprint never deletes another model's sessions. The
+// size cap and the LRU are global: they manage total disk across all models.
+//
+// The fingerprint names the build, model and settings that wrote the file; the
+// engine refuses a file of another one, so those go. A file's mtime is its last
+// use (save or restore), for the LRU and the age limit. Other files in the
+// folder are never touched. The engine writes a file under a temporary name and
+// renames it into place, so a file under its final name is complete; a leftover
+// temporary (.dc-*.tmp) is from a save that died.
+//
+// The legacy name, dc-<fingerprint>-<key>-<tokens>.session, has no namespace.
+// Load indexes it in namespace ""; Adopt moves a legacy file into a namespace
+// when its fingerprint is learned for that route, and renames it on disk.
 package store
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
@@ -39,30 +51,43 @@ type Options struct {
 
 // Entry is one file.
 type Entry struct {
-	Fingerprint, Key string
-	Tokens           int
-	Size             int64
-	Used             time.Time
+	Namespace, Fingerprint, Key string
+	Tokens                      int
+	Size                        int64
+	Used                        time.Time
 }
 
-// FileName is the name of the file for this fingerprint, key and token count.
-func FileName(fingerprint, key string, tokens int) string {
-	return fmt.Sprintf("dc-%s-%s-%d.session", fingerprint, key, tokens)
+// FileName is the name of the file for this namespace, fingerprint, key and
+// token count. An empty namespace is the legacy form.
+func FileName(namespace, fingerprint, key string, tokens int) string {
+	if namespace == "" {
+		return fmt.Sprintf("dc-%s-%s-%d.session", fingerprint, key, tokens)
+	}
+	return fmt.Sprintf("dc-%s-%s-%s-%d.session", namespace, fingerprint, key, tokens)
 }
 
 // Name is the entry's file name.
-func (e *Entry) Name() string { return FileName(e.Fingerprint, e.Key, e.Tokens) }
+func (e *Entry) Name() string { return FileName(e.Namespace, e.Fingerprint, e.Key, e.Tokens) }
+
+// NamespaceOf is the 12-hex namespace for a route: a sanitized (backend, model)
+// identity, so a route id with punctuation maps to a name-safe, stable prefix.
+func NamespaceOf(backend, model string) string {
+	sum := sha256.Sum256([]byte(backend + "/" + model))
+	return hex.EncodeToString(sum[:6])
+}
 
 var (
-	nameRe = regexp.MustCompile(`^dc-([0-9a-f]{12})-([0-9a-f]{64})-([1-9][0-9]*)\.session$`)
-	tempRe = regexp.MustCompile(`^\.dc-.*\.tmp$`)
+	nameRe      = regexp.MustCompile(`^dc-([0-9a-f]{12})-([0-9a-f]{64})-([1-9][0-9]*)\.session$`)
+	nameReNS    = regexp.MustCompile(`^dc-([0-9a-f]{12})-([0-9a-f]{12})-([0-9a-f]{64})-([1-9][0-9]*)\.session$`)
+	tempRe      = regexp.MustCompile(`^\.dc-.*\.tmp$`)
+	namespaceRe = regexp.MustCompile(`^([0-9a-f]{12})$`)
 )
 
 // Store is the index. It is safe for concurrent use.
 type Store struct {
 	opt     Options
 	mu      sync.Mutex
-	entries map[string]*Entry // by fingerprint/key
+	entries map[string]*Entry // by namespace/fingerprint/key
 }
 
 // New returns an empty store; Load reads the folder.
@@ -90,8 +115,9 @@ func freeSpace(dir string) (int64, error) {
 	return int64(st.Bavail) * st.Bsize, nil
 }
 
-// Load reads the folder: our files into the index; empty files, files in an
-// unknown format and leftover temporaries removed; then the limits applied.
+// Load reads the folder: our files into the index, in both name formats; empty
+// files, files in an unknown format and leftover temporaries removed; then the
+// limits applied.
 func (s *Store) Load() error {
 	ents, err := os.ReadDir(s.opt.Dir)
 	if err != nil {
@@ -110,26 +136,38 @@ func (s *Store) Load() error {
 		case !strings.HasPrefix(name, "dc-") || !strings.HasSuffix(name, ".session"):
 			// not ours
 		default:
-			m := nameRe.FindStringSubmatch(name)
+			ns, fp, key, m := splitName(name)
 			if m == nil || info.Size() == 0 {
 				s.remove(name, "unreadable", info.Size()) // an older format, or a broken write
 				continue
 			}
-			tokens, _ := strconv.Atoi(m[3])
-			e := &Entry{Fingerprint: m[1], Key: m[2], Tokens: tokens, Size: info.Size(), Used: info.ModTime()}
-			if old := s.entries[m[1]+"/"+m[2]]; old != nil { // one key, two token counts: keep the longer
+			tokens, _ := strconv.Atoi(m[len(m)-1])
+			e := &Entry{Namespace: ns, Fingerprint: fp, Key: key, Tokens: tokens, Size: info.Size(), Used: info.ModTime()}
+			if old := s.entries[ns+"/"+fp+"/"+key]; old != nil { // one key, two token counts: keep the longer
 				if old.Tokens >= tokens {
 					s.remove(name, "duplicate", e.Size)
 					continue
 				}
 				s.drop(old, "duplicate")
 			}
-			s.entries[m[1]+"/"+m[2]] = e
+			s.entries[ns+"/"+fp+"/"+key] = e
 		}
 	}
 	s.mu.Unlock()
 	s.Prune()
 	return nil
+}
+
+// splitName parses both formats: the namespaced one wins, then the legacy one
+// with namespace "". It returns the parts and the match, nil when neither fits.
+func splitName(name string) (namespace, fingerprint, key string, m []string) {
+	if m := nameReNS.FindStringSubmatch(name); m != nil {
+		return m[1], m[2], m[3], m
+	}
+	if m := nameRe.FindStringSubmatch(name); m != nil {
+		return "", m[1], m[2], m
+	}
+	return "", "", "", nil
 }
 
 func (s *Store) remove(name, why string, size int64) {
@@ -143,7 +181,7 @@ func (s *Store) remove(name, why string, size int64) {
 
 // drop removes e from the index and the disk; mu held.
 func (s *Store) drop(e *Entry, why string) {
-	delete(s.entries, e.Fingerprint+"/"+e.Key)
+	delete(s.entries, e.Namespace+"/"+e.Fingerprint+"/"+e.Key)
 	s.remove(e.Name(), why, e.Size)
 }
 
@@ -171,7 +209,9 @@ func (s *Store) total() (t int64) {
 	return t
 }
 
-// Prune applies the age limit and the size cap, oldest use first.
+// Prune applies the age limit and the size cap, oldest use first. Global:
+// total disk across every namespace, so one model's cache cannot starve the
+// folder for the others.
 func (s *Store) Prune() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -187,23 +227,63 @@ func (s *Store) Prune() {
 	}
 }
 
-// KeepFingerprint removes every file written under another fingerprint.
-func (s *Store) KeepFingerprint(fingerprint string) {
+// KeepFingerprint removes every file of namespace namespace written under
+// another fingerprint. Files of other namespaces are never touched: a 27B parent
+// learning its fingerprint must not evict the flash-next sessions it shares the
+// folder with.
+func (s *Store) KeepFingerprint(namespace, fingerprint string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, e := range s.byAge() {
-		if e.Fingerprint != fingerprint {
+		if e.Namespace == namespace && e.Fingerprint != fingerprint {
 			s.drop(e, "fingerprint")
 		}
 	}
 }
 
-// AnyFingerprint returns the fingerprint of the most recently used session file on disk, or "".
-func (s *Store) AnyFingerprint() string {
+// Adopt moves the legacy files of fingerprint fingerprint into namespace,
+// renaming them on disk so the scope is recorded in the name and survives a
+// restart. It returns how many files moved. Files of another namespace, and
+// files of another fingerprint, are not touched.
+func (s *Store) Adopt(namespace, fingerprint string) int {
+	if namespace == "" || !namespaceRe.MatchString(namespace) {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, e := range s.entries {
+		if e.Namespace != "" || e.Fingerprint != fingerprint {
+			continue
+		}
+		old := filepath.Join(s.opt.Dir, e.Name())
+		e.Namespace = namespace
+		if err := os.Rename(old, filepath.Join(s.opt.Dir, e.Name())); err != nil {
+			e.Namespace = ""
+			s.opt.Log.Warn("adopt rename", "file", filepath.Base(old), "namespace", namespace, "err", err)
+			continue
+		}
+		move := e // re-key the index entry in place
+		delete(s.entries, "/"+e.Fingerprint+"/"+e.Key)
+		s.entries[namespace+"/"+e.Fingerprint+"/"+e.Key] = move
+		n++
+	}
+	if n > 0 {
+		s.opt.Log.Info("adopt", "namespace", namespace, "fingerprint", fingerprint, "files", n)
+	}
+	return n
+}
+
+// AnyFingerprint returns the fingerprint of the most recently used session file
+// of namespace, or "".
+func (s *Store) AnyFingerprint(namespace string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var best *Entry
 	for _, e := range s.entries {
+		if e.Namespace != namespace {
+			continue
+		}
 		if best == nil || e.Used.After(best.Used) || (e.Used.Equal(best.Used) && e.Name() > best.Name()) {
 			best = e
 		}
@@ -244,13 +324,13 @@ func (s *Store) Reserve(need int64) bool {
 }
 
 // Lookup finds the file of the longest earlier turn of a conversation whose
-// prefix keys are keys (shortest first). A file that is gone or changed size
-// since it was indexed is dropped and the search goes on.
-func (s *Store) Lookup(fingerprint string, keys []string) (Entry, bool) {
+// prefix keys are keys (shortest first), in namespace namespace. A file that is
+// gone or changed size since it was indexed is dropped and the search goes on.
+func (s *Store) Lookup(namespace, fingerprint string, keys []string) (Entry, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i := len(keys) - 1; i >= 0; i-- {
-		e := s.entries[fingerprint+"/"+keys[i]]
+		e := s.entries[namespace+"/"+fingerprint+"/"+keys[i]]
 		if e == nil {
 			continue
 		}
@@ -263,28 +343,29 @@ func (s *Store) Lookup(fingerprint string, keys []string) (Entry, bool) {
 	return Entry{}, false
 }
 
-// Covered reports whether a file of one of keys holds at least tokens
-// tokens. A file of an earlier turn still counts: the engine reads only what
-// came after it.
-func (s *Store) Covered(fingerprint string, keys []string, tokens int) bool {
+// Covered reports whether a file of one of keys in namespace namespace holds at
+// least tokens tokens. A file of an earlier turn still counts: the engine reads
+// only what came after it.
+func (s *Store) Covered(namespace, fingerprint string, keys []string, tokens int) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, k := range keys {
-		if e := s.entries[fingerprint+"/"+k]; e != nil && e.Tokens >= tokens {
+		if e := s.entries[namespace+"/"+fingerprint+"/"+k]; e != nil && e.Tokens >= tokens {
 			return true
 		}
 	}
 	return false
 }
 
-// Commit indexes the file Strata just saved as FileName(fingerprint,
-// keys[last], planned), renamed to carry Strata's own token count when that
-// differs. The files of the conversation's earlier turns are superseded.
-func (s *Store) Commit(fingerprint string, keys []string, planned, tokens int) (Entry, error) {
+// Commit indexes the file the engine just saved as FileName(namespace,
+// fingerprint, keys[last], planned), renamed to carry the engine's own token
+// count when that differs. The files of the conversation's earlier turns are
+// superseded.
+func (s *Store) Commit(namespace, fingerprint string, keys []string, planned, tokens int) (Entry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := keys[len(keys)-1]
-	e := &Entry{Fingerprint: fingerprint, Key: key, Tokens: planned}
+	e := &Entry{Namespace: namespace, Fingerprint: fingerprint, Key: key, Tokens: planned}
 	if tokens > 0 && tokens != planned {
 		from := filepath.Join(s.opt.Dir, e.Name())
 		e.Tokens = tokens
@@ -298,11 +379,11 @@ func (s *Store) Commit(fingerprint string, keys []string, planned, tokens int) (
 	}
 	e.Size, e.Used = info.Size(), info.ModTime()
 	for _, k := range keys {
-		if old := s.entries[fingerprint+"/"+k]; old != nil && old.Name() != e.Name() {
+		if old := s.entries[namespace+"/"+fingerprint+"/"+k]; old != nil && old.Name() != e.Name() {
 			s.drop(old, "superseded")
 		}
 	}
-	s.entries[fingerprint+"/"+key] = e
+	s.entries[namespace+"/"+fingerprint+"/"+key] = e
 	return *e, nil
 }
 
@@ -310,7 +391,7 @@ func (s *Store) Commit(fingerprint string, keys []string, planned, tokens int) (
 func (s *Store) Touch(e Entry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if cur := s.entries[e.Fingerprint+"/"+e.Key]; cur != nil {
+	if cur := s.entries[e.Namespace+"/"+e.Fingerprint+"/"+e.Key]; cur != nil {
 		cur.Used = s.opt.Now()
 		_ = os.Chtimes(filepath.Join(s.opt.Dir, cur.Name()), cur.Used, cur.Used)
 	}
@@ -320,7 +401,7 @@ func (s *Store) Touch(e Entry) {
 func (s *Store) Forget(e Entry, why string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if cur := s.entries[e.Fingerprint+"/"+e.Key]; cur != nil && cur.Name() == e.Name() {
+	if cur := s.entries[e.Namespace+"/"+e.Fingerprint+"/"+e.Key]; cur != nil && cur.Name() == e.Name() {
 		s.drop(cur, why)
 	}
 }

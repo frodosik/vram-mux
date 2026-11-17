@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tfyl/strata-diskcache/internal/arbiter"
+	"github.com/tfyl/strata-diskcache/internal/engine"
 	"github.com/tfyl/strata-diskcache/internal/store"
 	"github.com/tfyl/strata-diskcache/internal/strata"
 )
@@ -20,6 +22,9 @@ type Policy struct {
 	// RAM per token of a parked conversation's snapshot, to predict a refused park
 	SnapshotBytesPerToken int64
 	MemAvailable          func() (int64, error) // default strata.MemAvailable
+	// BodyDivisor estimates the tokens of a conversation from its request body:
+	// bytes per token. 0: never estimate, only what the engine reports.
+	BodyDivisor int
 }
 
 // Actions, one per generation request.
@@ -30,23 +35,39 @@ const (
 	actMiss     = "miss"     // switches to a conversation with no copy anywhere
 	actBusy     = "busy"     // other requests in flight: passed through untouched
 	actUnkeyed  = "unkeyed"  // a body the cache can't key
-	actPass     = "pass"     // Strata didn't answer, or the body was too big to look at
+	actPass     = "pass"     // the engine didn't answer, or the body was too big to look at
 	actError    = "error"    // the cache's own logic failed
 )
 
-// cache decides, per generation request, what Strata needs before it. Strata
-// can save only the live conversation (a parked one is out of reach), and its
-// restore drops the live one without parking it. So: a continuing turn passes
-// straight through; a switch restores the incoming conversation's file unless
-// it is parked in RAM; the outgoing one is saved at the switch only when it
-// would be lost there, and otherwise while idle. See docs/design.md.
+// route is one (backend, model) identity and everything the cache remembers
+// about it. The session namespace is its own, so a 27B route learning a
+// fingerprint never touches flash-next's files.
+type route struct {
+	id         string
+	ns         string
+	eng        engine.Engine
+	fp         string
+	live       []string   // keys of the conversation this engine holds; nil: unknown
+	ram        [][]string // believed parked in RAM, most recent first
+	started    int64
+	liveTokens int   // tokens this engine holds for live, estimated when it cannot say
+	bpt        int64 // file bytes per token of this route's last save
+}
+
+// cache decides, per generation request, what the engine needs before it. An
+// engine can save only the live conversation (a parked one is out of reach), and
+// its restore drops the live one without parking it. So: a continuing turn
+// passes straight through; a switch restores the incoming conversation's file
+// unless it is parked in RAM; the outgoing one is saved at the switch only when
+// it would be lost there, and otherwise while idle. See docs/design.md.
 type cache struct {
-	eng   *strata.Client
-	files *store.Store
-	m     *Metrics
-	log   *slog.Logger
-	pol   Policy
-	keys  keyer
+	arb    *arbiter.Arbiter // nil: one upstream, no arbitration
+	routes map[string]*route
+	files  *store.Store
+	m      *Metrics
+	log    *slog.Logger
+	pol    Policy
+	keys   keyer
 
 	ctx    context.Context // ends with close; idle saves run under it
 	cancel context.CancelFunc
@@ -54,19 +75,16 @@ type cache struct {
 
 	saveMu sync.Mutex // one switch decision or idle save at a time
 
-	mu          sync.Mutex
-	inflight    int
-	seq         uint64
-	live        []string   // keys of the conversation the engine holds; nil: unknown
-	ram         [][]string // believed parked in RAM, most recent first
-	bpt         int64      // file bytes per token of the last save
-	fingerprint string
-	started     int64
-	idle        *time.Timer
+	mu       sync.Mutex
+	cur      *route // the route the last request used, the one idle saves watch
+	inflight int
+	seq      uint64
+	idle     *time.Timer
 }
 
 // ticket is one request's decision.
 type ticket struct {
+	route          *route
 	action, reason string
 	tokens         int // restored, or the outgoing conversation's
 	seq            uint64
@@ -76,16 +94,42 @@ type ticket struct {
 	prevParks      bool
 }
 
-func newCache(eng *strata.Client, files *store.Store, m *Metrics, log *slog.Logger, pol Policy) *cache {
+// route returns the cache's state for one route id; the proxy needs it to
+// prepare a request the arbiter just admitted.
+func (c *cache) route(id string) *route {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.routes[id]
+}
+
+// newCache builds the cache over the arbiter's routes. Without a store, there is
+// nothing to cache and the proxy is a plain forwarder.
+func newCache(arb *arbiter.Arbiter, files *store.Store, m *Metrics, log *slog.Logger, pol Policy) *cache {
 	if pol.MemAvailable == nil {
 		pol.MemAvailable = strata.MemAvailable
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &cache{eng: eng, files: files, m: m, log: log, pol: pol, ctx: ctx, cancel: cancel}
+	c := &cache{arb: arb, files: files, m: m, log: log, pol: pol, ctx: ctx, cancel: cancel, routes: map[string]*route{}}
+	for _, r := range arbRoutes(arb) {
+		c.routes[r.ID] = &route{id: r.ID, ns: r.Namespace, eng: r.Engine}
+	}
+	if arb != nil {
+		// The arbiter asks for the save before it gives the card away.
+		arb.SetSaveLive(c.SaveLive)
+	}
+	return c
+}
+
+// arbRoutes is the arbiter's route list; nil-safe for a single-upstream proxy.
+func arbRoutes(arb *arbiter.Arbiter) []arbiter.Route {
+	if arb == nil {
+		return nil
+	}
+	return arb.Routes()
 }
 
 // close stops idle saves and waits for one under way until ctx ends. A save
-// Strata is still writing completes on its own; the next start indexes it.
+// the engine is still writing completes on its own; the next start indexes it.
 func (c *cache) close(ctx context.Context) error {
 	c.mu.Lock()
 	c.cancel() // under mu: no turn ending now can schedule another idle save
@@ -103,10 +147,28 @@ func (c *cache) close(ctx context.Context) error {
 	}
 }
 
-// prepare runs before a generation request is forwarded. Whatever happens in
-// it, the request goes on: errors and panics only cost the cache.
-func (c *cache) prepare(ctx context.Context, path string, body []byte) (t *ticket) {
-	t = &ticket{action: actError}
+// identity is the route's RAM cache state and the fingerprint it must be keyed
+// by. Strata answers both from /metrics; llama.cpp has no RAM cache, so its
+// identity comes from GET /models, which never loads a model. An unloaded engine
+// answers neither, and the error is the answer: there is nothing to key by.
+func (c *cache) identity(ctx context.Context, r *route) (engine.CacheInfo, error) {
+	en, err := r.eng.CacheInfo(ctx)
+	if err != nil || en.Fingerprint != "" {
+		return en, err
+	}
+	fp, ferr := r.eng.Fingerprint(ctx)
+	if ferr != nil {
+		return engine.CacheInfo{}, ferr
+	}
+	en.Fingerprint = fp
+	return en, nil
+}
+
+// prepare runs before a generation request is forwarded, once the arbiter has
+// admitted it and made its route the resident. Whatever happens in it, the
+// request goes on: errors and panics only cost the cache.
+func (c *cache) prepare(ctx context.Context, path string, body []byte, r *route) (t *ticket) {
+	t = &ticket{route: r, action: actError}
 	defer func() {
 		if v := recover(); v != nil {
 			c.log.Error("cache panic; request passed through", "path", path, "panic", fmt.Sprint(v))
@@ -119,7 +181,7 @@ func (c *cache) prepare(ctx context.Context, path string, body []byte) (t *ticke
 	c.inflight++
 	c.seq++
 	t.seq, t.counted, t.keys = c.seq, true, keys
-	busy, live := c.inflight > 1, c.live
+	busy := c.inflight > 1
 	c.mu.Unlock()
 
 	switch {
@@ -130,59 +192,73 @@ func (c *cache) prepare(ctx context.Context, path string, body []byte) (t *ticke
 		t.action, t.reason = actUnkeyed, "no_messages"
 		return t
 	}
-	st, err := c.eng.Status(ctx)
+	st, err := r.eng.Status(ctx)
 	if err != nil {
-		t.action, t.reason = actPass, "status_"+strata.ErrorKind(err)
+		t.action, t.reason = actPass, "status_"+engine.ErrorKind(err)
 		return t
 	}
-	if c.restarted(st) {
-		live = nil
+	if c.restarted(r, st) {
+		r.live = nil
 	}
-	if live != nil && extends(keys, live) {
+	// How many tokens the engine holds for the conversation it last served. Strata
+	// says; the llama.cpp router says nothing, so the request body sizes it: a
+	// session save is keyed by the last key and the engine's own count, the
+	// estimate only decides whether a save is worth starting.
+	live := st.LiveTokens
+	if live <= 0 && c.pol.BodyDivisor > 0 {
+		live = len(body) / c.pol.BodyDivisor
+	}
+	c.mu.Lock()
+	r.liveTokens = live
+	c.mu.Unlock()
+	if r.live != nil && extends(keys, r.live) {
 		t.action, t.reason = actContinue, "live"
 		return t
 	}
 
-	// A switch. An idle save under way finishes first; Strata would queue this
+	// A switch. An idle save under way finishes first; the engine would queue this
 	// request behind it anyway.
 	c.saveMu.Lock()
 	defer c.saveMu.Unlock()
+	en, err := c.identity(ctx, r)
 	var fp string
-	en, err := c.eng.Engine(ctx)
 	switch {
 	case err == nil:
-		fp = c.learn(en)
+		fp = c.learn(r, en)
 	case !st.Loaded:
 		// An unloaded engine has no /metrics to read a fingerprint from. The last one we
-		// learned, or the newest file on disk, is what a restore has to match; a cold start
-		// with no files has nothing to restore.
+		// learned, or the newest file of this route on disk, is what a restore has to
+		// match; a cold start with no files has nothing to restore.
 		c.mu.Lock()
-		fp = c.fingerprint
+		fp = r.fp
 		c.mu.Unlock()
 		if fp == "" {
-			fp = c.files.AnyFingerprint()
+			fp = c.files.AnyFingerprint(r.ns)
+			if fp != "" {
+				c.files.Adopt(r.ns, fp)
+			}
 		}
 		if fp == "" {
 			t.action, t.reason = actMiss, "engine_unloaded_cold"
 			return t
 		}
 	default:
-		t.action, t.reason = actMiss, "engine_"+strata.ErrorKind(err)
+		t.action, t.reason = actMiss, "engine_"+engine.ErrorKind(err)
 		return t
 	}
-	inRAM := c.inRAM(keys)
+	inRAM := c.inRAM(r, keys)
 	var file store.Entry
 	var onDisk bool
 	if !inRAM {
-		file, onDisk = c.files.Lookup(fp, keys)
+		file, onDisk = c.files.Lookup(r.ns, fp, keys)
 	}
-	if live != nil {
-		t.prev, t.tokens = live, st.LiveTokens
-		t.prevParks = c.willPark(st.LiveTokens, en)
+	if r.live != nil {
+		t.prev, t.tokens = r.live, live
+		t.prevParks = c.willPark(live, en, r)
 		if t.prevParks && !onDisk {
-			c.skip("parks", st.LiveTokens)
+			c.skip("parks", live)
 		} else {
-			c.save(ctx, fp, live, st.LiveTokens, "switch")
+			c.save(ctx, r, fp, r.live, live, "switch")
 		}
 	}
 	switch {
@@ -190,70 +266,107 @@ func (c *cache) prepare(ctx context.Context, path string, body []byte) (t *ticke
 		t.action, t.reason = actRAM, "parked"
 	case !onDisk:
 		t.action, t.reason = actMiss, "no_copy"
-	case c.restore(ctx, file, t):
+		c.m.prefill(len(keys)) // nothing to restore: the engine reads the whole prompt
+	case c.restore(ctx, r, file, t):
 		t.action, t.reason = actDisk, "restored"
 		t.prevParks = false // a restore drops the outgoing conversation
 	default:
 		t.action, t.reason = actMiss, "restore_failed"
+		c.m.prefill(len(keys))
 	}
 	return t
 }
 
-// invalidate forgets the live conversation: a request the cache didn't see
-// into (another endpoint, an oversized body) may have changed it.
+// SaveLive saves the conversation this route holds before the arbiter gives the
+// card away. Best effort: the arbiter unloads after it, whatever it cost.
+func (c *cache) SaveLive(ctx context.Context, r arbiter.Route) {
+	c.mu.Lock()
+	rt := c.routes[r.ID]
+	if rt == nil {
+		c.mu.Unlock()
+		return
+	}
+	live, fp, tokens := rt.live, rt.fp, rt.liveTokens
+	c.mu.Unlock()
+	if live == nil || fp == "" {
+		return
+	}
+	if st, err := rt.eng.Status(ctx); err == nil && st.Loaded && st.LiveTokens > tokens {
+		tokens = st.LiveTokens // Strata says how much it holds; the router says nothing
+	}
+	if tokens <= 0 {
+		return
+	}
+	c.saveMu.Lock()
+	defer c.saveMu.Unlock()
+	c.save(context.WithoutCancel(ctx), rt, fp, live, tokens, "yield")
+}
+
+// invalidate forgets every route's live conversation: a request the cache didn't
+// see into (another endpoint, an oversized body) may have changed one.
 func (c *cache) invalidate() {
 	c.mu.Lock()
-	c.live = nil
+	for _, r := range c.routes {
+		r.live = nil
+	}
 	c.mu.Unlock()
 }
 
-// restarted notes a server restart or an unloaded engine: the RAM cache and
-// the live conversation are gone.
-func (c *cache) restarted(st strata.Status) bool {
+// restarted notes a server restart or an unloaded engine: the RAM cache and the
+// live conversation of that route are gone.
+func (c *cache) restarted(r *route, st engine.Status) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	gone := (c.started != 0 && st.Started != c.started) || !st.Loaded
-	c.started = st.Started
+	gone := (r.started != 0 && st.Started != r.started) || !st.Loaded
+	r.started = st.Started
 	if gone {
-		c.live, c.ram = nil, nil
+		r.live, r.ram = nil, nil
 	}
 	return gone
 }
 
-// learn records the engine's fingerprint and how many conversations it has
-// parked. A new fingerprint makes every file of another one useless.
-func (c *cache) learn(en strata.Engine) string {
-	c.mu.Lock()
-	changed := en.Fingerprint != c.fingerprint
-	c.fingerprint = en.Fingerprint
-	if changed {
-		c.ram = nil
+// learn records the route's fingerprint and how many conversations it has
+// parked. A new fingerprint makes every file of that route's other fingerprints
+// useless, and adopts the legacy files written for it. Files of other routes are
+// never touched: this is the scope that keeps flash-next's sessions alive while
+// the 27B route learns its own.
+func (c *cache) learn(r *route, en engine.CacheInfo) string {
+	fp := en.Fingerprint
+	if fp == "" {
+		return r.fp // nothing was read: the route keeps the identity it knows
 	}
-	c.ram = c.ram[:min(len(c.ram), en.Parked)] // the engine evicts the oldest first
+	c.mu.Lock()
+	changed := fp != "" && fp != r.fp
+	r.fp = fp
+	if changed {
+		r.ram = nil
+	}
+	r.ram = r.ram[:min(len(r.ram), en.Parked)]
 	c.mu.Unlock()
 	if changed {
-		c.log.Info("engine fingerprint", "fingerprint", en.Fingerprint)
-		c.files.KeepFingerprint(en.Fingerprint)
+		c.log.Info("engine fingerprint", "route", r.id, "fingerprint", fp)
+		c.files.Adopt(r.ns, fp)
+		c.files.KeepFingerprint(r.ns, fp)
 	}
-	return en.Fingerprint
+	return fp
 }
 
-func (c *cache) inRAM(keys []string) bool {
+func (c *cache) inRAM(r *route, keys []string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for _, r := range c.ram {
-		if extends(keys, r) {
+	for _, k := range r.ram {
+		if extends(keys, k) {
 			return true
 		}
 	}
 	return false
 }
 
-// willPark reports whether the engine parks a conversation of this many
-// tokens on the switch away from it. It evicts parked ones to make room, so it
-// refuses only one bigger than the whole budget, or one that leaves less than
-// the RAM floor even with every parked one evicted.
-func (c *cache) willPark(tokens int, en strata.Engine) bool {
+// willPark reports whether the engine parks a conversation of this many tokens
+// on the switch away from it. It evicts parked ones to make room, so it refuses
+// only one bigger than the whole budget, or one that leaves less than the RAM
+// floor even with every parked one evicted.
+func (c *cache) willPark(tokens int, en engine.CacheInfo, r *route) bool {
 	minTokens := c.pol.ParkMinTokens
 	if minTokens < 0 {
 		minTokens = en.MinTokens
@@ -271,20 +384,20 @@ func (c *cache) skip(reason string, tokens int) {
 	c.log.Info("save skipped", "reason", reason, "tokens", tokens)
 }
 
-// save writes the live conversation to disk unless it is short, already on
-// disk or doesn't fit. It outlives the request's context: Strata finishes a
-// save it started anyway, and the index must know about it.
-func (c *cache) save(ctx context.Context, fp string, live []string, tokens int, trigger string) {
+// save writes the live conversation to disk unless it is short, already on disk
+// or doesn't fit. It outlives the request's context: the engine finishes a save
+// it started anyway, and the index must know about it.
+func (c *cache) save(ctx context.Context, r *route, fp string, live []string, tokens int, trigger string) {
 	switch {
 	case tokens < c.pol.MinTokens:
 		c.skip("short", tokens)
 		return
-	case c.files.Covered(fp, live, tokens-c.pol.RegrowTokens):
+	case c.files.Covered(r.ns, fp, live, tokens-c.pol.RegrowTokens):
 		c.skip("on_disk", tokens)
 		return
 	}
 	c.mu.Lock()
-	bpt := c.bpt
+	bpt := r.bpt
 	c.mu.Unlock()
 	if bpt <= 0 {
 		bpt = 32 << 10 // ~25 KB/token measured; err high
@@ -294,77 +407,79 @@ func (c *cache) save(ctx context.Context, fp string, live []string, tokens int, 
 		return
 	}
 	t0 := time.Now()
-	n, _, err := c.eng.Save(context.WithoutCancel(ctx), store.FileName(fp, live[len(live)-1], tokens))
+	n, _, err := r.eng.Save(context.WithoutCancel(ctx), store.FileName(r.ns, fp, live[len(live)-1], tokens))
 	d := time.Since(t0)
 	if err != nil {
-		c.m.failures.WithLabelValues("save", strata.ErrorKind(err)).Inc()
-		c.log.Warn("save failed", "trigger", trigger, "tokens", tokens, "ms", d.Milliseconds(), "reason", strata.ErrorKind(err), "err", err)
+		c.m.failures.WithLabelValues("save", engine.ErrorKind(err)).Inc()
+		c.log.Warn("save failed", "route", r.id, "trigger", trigger, "tokens", tokens, "ms", d.Milliseconds(),
+			"reason", engine.ErrorKind(err), "err", err)
 		return
 	}
-	e, err := c.files.Commit(fp, live, tokens, n)
+	e, err := c.files.Commit(r.ns, fp, live, tokens, n)
 	if err != nil {
 		c.m.failures.WithLabelValues("save", "index").Inc()
-		c.log.Warn("save not indexed", "err", err)
+		c.log.Warn("save not indexed", "route", r.id, "err", err)
 		return
 	}
 	c.m.saved(trigger, e.Size, d)
 	c.mu.Lock()
-	c.bpt = e.Size / int64(e.Tokens)
+	r.bpt = e.Size / int64(e.Tokens)
 	c.mu.Unlock()
-	c.log.Info("save", "trigger", trigger, "tokens", e.Tokens, "mb", e.Size>>20, "ms", d.Milliseconds())
+	c.log.Info("save", "route", r.id, "trigger", trigger, "tokens", e.Tokens, "mb", e.Size>>20, "ms", d.Milliseconds())
 }
 
-func (c *cache) restore(ctx context.Context, e store.Entry, t *ticket) bool {
+func (c *cache) restore(ctx context.Context, r *route, e store.Entry, t *ticket) bool {
 	uCtx := context.WithoutCancel(ctx)
 	t0 := time.Now()
-	n, b, err := c.eng.Restore(uCtx, e.Name())
-	if strata.IsUnloaded(err) {
-		// A --lazy engine loads on the next request: wake it, check it is still the engine
-		// the file was written for, and give it the restore it refused.
-		c.log.Info("waking engine for restore", "tokens", e.Tokens)
-		if err = c.eng.Wakeup(uCtx); err == nil {
-			en, eerr := c.eng.Engine(uCtx)
+	n, b, err := r.eng.Restore(uCtx, e.Name())
+	if r.eng.IsUnloaded(err) {
+		// A --lazy engine loads on the next request: wake it, check it is still the
+		// engine the file was written for, and give it the restore it refused.
+		c.log.Info("waking engine for restore", "route", r.id, "tokens", e.Tokens)
+		if err = r.eng.Wake(uCtx); err == nil {
+			en, eerr := c.identity(uCtx, r)
 			if eerr != nil {
 				err = eerr
 			} else {
-				switch fp := c.learn(en); {
+				switch fp := c.learn(r, en); {
 				case fp != e.Fingerprint:
-					c.log.Warn("woken into another engine; reading fresh", "wanted", e.Fingerprint, "got", fp)
+					c.log.Warn("woken into another engine; reading fresh", "route", r.id, "wanted", e.Fingerprint, "got", fp)
 					c.m.failures.WithLabelValues("restore", "fingerprint").Inc()
 					return false
 				default:
 					t0 = time.Now()
-					n, b, err = c.eng.Restore(uCtx, e.Name())
+					n, b, err = r.eng.Restore(uCtx, e.Name())
 				}
 			}
 		}
 	}
 	d := time.Since(t0)
 	if err != nil {
-		kind := strata.ErrorKind(err)
+		kind := engine.ErrorKind(err)
 		c.m.failures.WithLabelValues("restore", kind).Inc()
-		c.log.Warn("restore failed; reading fresh", "tokens", e.Tokens, "ms", d.Milliseconds(), "reason", kind, "err", err)
+		c.log.Warn("restore failed; reading fresh", "route", r.id, "tokens", e.Tokens, "ms", d.Milliseconds(),
+			"reason", kind, "err", err)
 		if kind == "not_found" || kind == "invalid" || kind == "io" { // one it had no RAM for stays
 			c.files.Forget(e, "unreadable")
 		}
 		return false
 	}
 	if n < e.Tokens/2 {
-		// The file on disk restored far less than its name claims: a save cut short. Keep it
-		// and every later turn finds it "covered" and is never saved.
-		c.log.Warn("truncated session file; forgetting", "expected", e.Tokens, "actual", n)
+		// The file on disk restored far less than its name claims: a save cut short.
+		// Keep it and every later turn finds it "covered" and is never saved.
+		c.log.Warn("truncated session file; forgetting", "route", r.id, "expected", e.Tokens, "actual", n)
 		c.files.Forget(e, "truncated")
 	} else {
 		c.files.Touch(e)
 	}
 	c.m.restored(b, d)
 	t.tokens = n
-	c.log.Info("restore", "tokens", n, "mb", b>>20, "ms", d.Milliseconds())
+	c.log.Info("restore", "route", r.id, "tokens", n, "mb", b>>20, "ms", d.Milliseconds())
 	return true
 }
 
-// finish records the end of t's request: its HTTP status, and whether the
-// client went away before the answer was complete.
+// finish records the end of t's request: its HTTP status, and whether the client
+// went away before the answer was complete.
 func (c *cache) finish(t *ticket, status int, clientGone bool) {
 	c.m.requests.WithLabelValues(t.action).Inc()
 	c.mu.Lock()
@@ -372,20 +487,22 @@ func (c *cache) finish(t *ticket, status int, clientGone bool) {
 	if t.counted {
 		c.inflight--
 	}
+	r := t.route
 	if status >= 500 {
-		c.ram = nil // the engine may have died, and its RAM cache with it
+		r.ram = nil // the engine may have died, and its RAM cache with it
 	}
 	switch {
 	case t.action != actContinue && t.action != actRAM && t.action != actDisk && t.action != actMiss,
 		c.seq != t.seq, status != 200, clientGone:
-		c.live = nil // another request may have run in between, or this one left no clean state
+		r.live = nil // another request may have run in between, or this one left no clean state
 		return
 	}
 	if t.prevParks {
-		c.ram = append([][]string{t.prev}, dropTurnsOf(c.ram, t.prev)...)
+		r.ram = append([][]string{t.prev}, dropTurnsOf(r.ram, t.prev)...)
 	}
-	c.ram = dropTurnsOf(c.ram, t.keys) // now live, not parked
-	c.live = t.keys
+	r.ram = dropTurnsOf(r.ram, t.keys) // now live, not parked
+	r.live = t.keys
+	c.cur = r
 	if c.pol.IdleDelay > 0 && c.ctx.Err() == nil {
 		if c.idle != nil && c.idle.Stop() {
 			c.wg.Done()
@@ -396,8 +513,8 @@ func (c *cache) finish(t *ticket, status int, clientGone bool) {
 	}
 }
 
-// idleSave saves the live conversation if nothing has started since the turn
-// numbered seq ended.
+// idleSave saves the live conversation of the route the last turn used, if
+// nothing has started since the turn numbered seq ended.
 func (c *cache) idleSave(seq uint64) {
 	defer func() {
 		if v := recover(); v != nil {
@@ -408,14 +525,18 @@ func (c *cache) idleSave(seq uint64) {
 	c.saveMu.Lock()
 	defer c.saveMu.Unlock()
 	c.mu.Lock()
-	live, fp := c.live, c.fingerprint
+	r, live, fp, est := c.cur, c.cur.live, c.cur.fp, c.cur.liveTokens
 	quiet := c.seq == seq && c.inflight == 0 && live != nil && fp != "" && c.ctx.Err() == nil
 	c.mu.Unlock()
 	if !quiet {
 		return
 	}
-	if st, err := c.eng.Status(c.ctx); err == nil && !c.restarted(st) {
-		c.save(c.ctx, fp, live, st.LiveTokens, "idle")
+	if st, err := r.eng.Status(c.ctx); err == nil && !c.restarted(r, st) {
+		tokens := st.LiveTokens
+		if tokens < est {
+			tokens = est // the router reports none: keep the estimate
+		}
+		c.save(c.ctx, r, fp, live, tokens, "idle")
 	}
 }
 
