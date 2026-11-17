@@ -784,10 +784,12 @@ func TestKeys(t *testing.T) {
 	}
 }
 
-// A save's bytes-per-token is learned from a conversation worth saving. Strata's
-// live count can be 175K tokens while the file it writes is 226 MB of fixed
-// overhead, so a 3 MB/token estimate for the next reserve is a 175K conversation
-// asking for 534 GB, and the save is skipped: the session is lost at the switch.
+// A save's bytes-per-token is learned only from a conversation worth saving. The
+// engine can report a live count of 175K tokens and write a file dominated by
+// fixed overhead, answering 74 tokens saved over 226 MB — 3 MB/token. With that
+// estimate the next reserve reads a 175K conversation as 534 GB over the cap, the
+// save is skipped, and the session is lost at the switch. The guard keeps the
+// 32 KB/token default, which fits.
 func TestSmallSaveDoesNotPoisonTheEstimate(t *testing.T) {
 	e := setup(t, time.Second, 1<<20)
 	e.f.Update(func(f *stratatest.Fake) { f.Tokens, f.SavedTokens, f.SaveBytes = 175000, 74, 226 << 20 })

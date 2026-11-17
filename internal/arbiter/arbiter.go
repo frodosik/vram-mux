@@ -1,8 +1,11 @@
 // Package arbiter owns the one GPU. It treats each (backend, model) pair as a
 // distinct resident identity, keeps one route resident at a time, and gives the
 // VRAM to another route only between requests: drain the running turn, save the
-// session, unload, check the free VRAM, load. It never runs inside a client's
-// request, so a client's request never pays for a model load.
+// session, unload, check the free VRAM, load. It never runs inside a forwarded
+// request, so a swap is always paid for between requests. The admission of a
+// request for the resident route can also pay for a load, but only when that
+// model has disappeared from the card (the router's idle sleep, a dead engine, a
+// swap refused after the unload) — a request never takes the card.
 //
 // The queue rule is resident-drain: requests for the route that is resident now
 // are admitted ahead of a request that wants to take the card, so a 27B parent
@@ -59,9 +62,9 @@ type Options struct {
 	VRAMMargin        int64         // bytes that must stay free on the card after a load
 	VRAMFree          func() (int64, error)
 	PollInterval      time.Duration
-	// InitialResident is the route that owns the card at startup, loaded by the
-	// server itself: a Strata server with --lazy takes its model on the first
-	// request, so the arbiter must not load it and must not treat it as idle.
+	// InitialResident is the route that owns the card at startup. A Strata server
+	// with --lazy has not loaded its model yet, so the arbiter treats it as resident
+	// and loads it on that route's first admission (ensureLoaded), not as idle.
 	InitialResident string
 	Log             *slog.Logger
 	Observers       Observers
@@ -104,7 +107,9 @@ func (a *Arbiter) Routes() []Route { return a.opt.Routes }
 // live conversation before giving the card away. It is set once, at startup,
 // before any request is admitted.
 func (a *Arbiter) SetSaveLive(f func(ctx context.Context, r Route)) {
+	a.mu.Lock()
 	a.opt.SaveLive = f
+	a.mu.Unlock()
 }
 
 // New returns an arbiter over opt.Routes. The first route is the initial
@@ -276,23 +281,35 @@ func (a *Arbiter) pick() *waiter {
 	return winner
 }
 
-// ensureLoaded loads the resident route's model when it is not resident: the
-// router's idle sleep, a dead engine, or a swap that was refused after the
-// unload, all leave the arbiter's resident route with nothing to answer. The
-// gate is the same as a swap's: the load must fit.
+// ensureLoaded loads the resident route's model when the engine says it is not
+// loaded: the router's idle sleep, a dead engine, or a swap that was refused
+// after the unload, all leave the arbiter's resident route with nothing to
+// answer. Only a positive "not loaded" answer counts: a status read that fails
+// (a 3 s timeout, a router blip, a non-200) is not evidence the model is gone,
+// and loading on that evidence would clear a live conversation that is there.
+// One LoadTimeout covers the gate and the load together, as the option says.
 func (a *Arbiter) ensureLoaded(ctx context.Context, r Route) error {
-	if st, err := r.Engine.Status(ctx); err == nil && st.Loaded {
+	st, err := r.Engine.Status(ctx)
+	if err != nil {
 		return nil
 	}
-	if err := a.waitForVRAM(ctx, r); err != nil {
+	if st.Loaded {
+		return nil
+	}
+	window, cancel := context.WithTimeout(ctx, a.opt.LoadTimeout)
+	defer cancel()
+	if err := a.waitForVRAM(window, r); err != nil {
 		a.blocked("vram")
 		a.log().Warn("not enough VRAM free to reload", "route", r.ID, "need", r.Need, "margin", a.opt.VRAMMargin, "err", err)
 		return err
 	}
-	if err := r.Engine.Load(ctx); err != nil {
-		a.blocked("load")
+	if err := r.Engine.Load(window); err != nil {
+		a.blocked("reload")
 		// Fail open: an engine that cannot load answers its own reason, and that is
-		// the client's best answer. The admission is not refused on a failed load.
+		// the client's best answer. The admission is not refused on a failed load,
+		// and the route's stale live/ram beliefs are dropped by finish when the
+		// engine's 5xx reaches the client. Reloaded fires only on a load that
+		// succeeded: a failed load did not replace any conversation.
 		a.log().Warn("reload refused; the request goes to the engine", "route", r.ID, "err", err)
 		return nil
 	}

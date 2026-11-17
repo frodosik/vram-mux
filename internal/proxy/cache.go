@@ -427,7 +427,13 @@ func (c *cache) save(ctx context.Context, r *route, fp string, live []string, to
 	bpt := r.bpt
 	c.mu.Unlock()
 	if bpt <= 0 {
-		bpt = 32 << 10 // ~25 KB/token measured; err high
+		// The fallback for a route that has never saved. Measured figures: Strata
+		// k8v4 is 13.8 KB/token, a llama slot with f16 KV + draft layers is
+		// 85.7 KB/token, so 32 KB/token over-reserves Strata by ~2.3x (no_room fires
+		// early and long sessions are never saved) and under-reserves llama by ~2.6x
+		// (reservations pass a cap the real files then blow through). A route learns
+		// its own figure from its first save worth saving.
+		bpt = 32 << 10
 	}
 	if !c.files.Reserve(int64(tokens) * bpt) {
 		c.skip("no_room", tokens)

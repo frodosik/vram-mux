@@ -4,6 +4,17 @@
 
 ### Changed
 
+- The arbiter owns model loads: admission loads the resident route's model when the engine reports
+  unloaded, and a load that succeeds drops that route's live-conversation beliefs. The cache no
+  longer wakes an engine by sending a request. A load the engine refuses is fail-open.
+- The VRAM gate asks for a route's floor, not what it fills, and auto-detects the card with the
+  most VRAM when `--vram-sysfs` is left at its default.
+- A save's bytes-per-token estimate is learned only from a save of at least `--min-tokens`, so a
+  short conversation's file does not poison the next reserve.
+- The instance port is not part of a llama fingerprint, so slot files survive a router restart.
+- `reloads_total{route}` is exported, and `swap_blocked_total` reports `reason="reload"` for a
+  reload that the gate refused.
+
 - **Flags take two dashes** (`--session-dir`, not `-session-dir`). The environment variables are unchanged.
 - `go install` path is now `github.com/tfyl/strata-diskcache/cmd/strata-diskcache@latest`.
 - Session files are named `dc-<fingerprint>-<key>-<tokens>.session`. Files in the first version's format are

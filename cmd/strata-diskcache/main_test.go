@@ -280,3 +280,18 @@ func TestBootWiring(t *testing.T) {
 		t.Errorf("strata calls: %v, want the live session saved before the card moves", strataSeen)
 	}
 }
+
+// The default flag names card0, which is not the shared card on a box with an
+// integrated GPU. The default auto-detects; an explicit flag is taken as given; a
+// detect that finds nothing keeps the flag.
+func TestVRAMCardSelection(t *testing.T) {
+	if got := vramCard(defaultVRAMSysfs, func() string { return "/sys/class/drm/card1/device" }); got != "/sys/class/drm/card1/device" {
+		t.Errorf("default flag: %s", got)
+	}
+	if got := vramCard("/sys/class/drm/card2/device", func() string { return "/sys/class/drm/card1/device" }); got != "/sys/class/drm/card2/device" {
+		t.Errorf("an explicit flag was auto-detected away: %s", got)
+	}
+	if got := vramCard(defaultVRAMSysfs, func() string { return "" }); got != defaultVRAMSysfs {
+		t.Errorf("a detect that found nothing: %s", got)
+	}
+}

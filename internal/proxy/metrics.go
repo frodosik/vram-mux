@@ -10,15 +10,15 @@ import (
 
 // Metrics are the proxy's Prometheus metrics, all strata_diskcache_*.
 type Metrics struct {
-	requests, savesBy, skipped, failures, evictions, evictedBytes *prometheus.CounterVec
-	saves, restores, savedBytes, restoredBytes, panics            prometheus.Counter
-	saveSeconds, restoreSeconds                                   prometheus.Histogram
-	lastSave, lastRestore                                         prometheus.Gauge
-	swaps, prefillTokens, reloads                                 prometheus.Counter
-	swapSeconds                                                   prometheus.Histogram
-	swapBlocked                                                   *prometheus.CounterVec
-	queue                                                         prometheus.Gauge
-	resident                                                      *prometheus.GaugeVec
+	requests, savesBy, skipped, failures, evictions, evictedBytes, reloads *prometheus.CounterVec
+	saves, restores, savedBytes, restoredBytes, panics                     prometheus.Counter
+	saveSeconds, restoreSeconds                                            prometheus.Histogram
+	lastSave, lastRestore                                                  prometheus.Gauge
+	swaps, prefillTokens                                                   prometheus.Counter
+	swapSeconds                                                            prometheus.Histogram
+	swapBlocked                                                            *prometheus.CounterVec
+	queue                                                                  prometheus.Gauge
+	resident                                                               *prometheus.GaugeVec
 }
 
 // NewMetrics registers the metrics with reg.
@@ -49,7 +49,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		restoredBytes:  counter("restored_bytes_total", "Bytes read from session files."),
 		panics:         counter("panics_total", "Panics in the cache logic (the request went through)."),
 		swaps:          counter("swaps_total", "Times the card was given to another route."),
-		reloads:        counter("reloads_total", "Times the resident route's model was loaded from cold."),
+		reloads:        vec("reloads_total", "Times a resident route's model was loaded from cold, by route.", "route"),
 		prefillTokens:  counter("re_prefill_tokens_total", "Tokens of requests that ran with no session to restore, an estimate of what a swap cost in re-prefill."),
 		saveSeconds:    hist("save_seconds", "Time to save a session file."),
 		restoreSeconds: hist("restore_seconds", "Time to restore a session file."),
@@ -61,9 +61,10 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		lastRestore: prometheus.NewGauge(prometheus.GaugeOpts(opts("last_restore_ms", "Duration of the last restore."))),
 		resident:    prometheus.NewGaugeVec(prometheus.GaugeOpts(opts("resident_route", "1 for the route holding the card.")), []string{"route"}),
 	}
-	reg.MustRegister(m.requests, m.savesBy, m.skipped, m.failures, m.evictions, m.evictedBytes, m.saves, m.restores,
-		m.savedBytes, m.restoredBytes, m.panics, m.swaps, m.reloads, m.prefillTokens, m.saveSeconds, m.restoreSeconds,
-		m.swapSeconds, m.swapBlocked, m.queue, m.resident, m.lastSave, m.lastRestore)
+	reg.MustRegister(m.requests, m.savesBy, m.skipped, m.failures, m.evictions, m.evictedBytes, m.reloads,
+		m.saves, m.restores, m.savedBytes, m.restoredBytes, m.panics, m.swaps, m.prefillTokens,
+		m.saveSeconds, m.restoreSeconds, m.swapSeconds, m.swapBlocked, m.queue, m.resident,
+		m.lastSave, m.lastRestore)
 	return m
 }
 
@@ -123,7 +124,7 @@ func (m *Metrics) SwapBlocked(reason string) {
 
 // Reloaded is the arbiter's Observers.Reloaded.
 func (m *Metrics) Reloaded(route string) {
-	m.reloads.Inc()
+	m.reloads.WithLabelValues(route).Inc()
 }
 
 // Queue is the arbiter's Observers.Queue.

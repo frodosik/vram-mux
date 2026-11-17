@@ -39,6 +39,20 @@ var version = "dev"
 // "the operator named a card" from "the card has to be found".
 const defaultVRAMSysfs = "/sys/class/drm/card0/device"
 
+// vramCard is the node the free-VRAM gate reads. An explicit flag is taken as
+// given; the default names card0, which on a box with an integrated GPU is not
+// the card the engines share, so the default auto-detects the card with the most
+// VRAM. A detect that finds nothing keeps the flag.
+func vramCard(flag string, detect func() string) string {
+	if flag != defaultVRAMSysfs {
+		return flag
+	}
+	if card := detect(); card != "" {
+		return card
+	}
+	return flag
+}
+
 // config is the command line. Every flag can also be set by its environment
 // variable; the flag wins.
 type config struct {
@@ -61,7 +75,7 @@ type config struct {
 
 	StrataModel   string `name:"strata-model" env:"STRATA_MODEL" default:"qwen3.8-flash-next-iq2_xs" help:"The model the Strata route answers for."`
 	StrataAPIKey  string `name:"strata-api-key" env:"STRATA_API_KEY" help:"Bearer token Strata needs, if any."`
-	StrataNeedMiB int64  `name:"strata-need-mib" env:"STRATA_NEED_MIB" default:"0" help:"VRAM the Strata route needs, for the free-memory gate. 0: gate on the margin only."`
+	StrataNeedMiB int64  `name:"strata-need-mib" env:"STRATA_NEED_MIB" default:"0" help:"VRAM the Strata route must have free to load: its floor, not what it fills (expert-cache auto sizes to the free VRAM it finds). 0: gate on the margin only."`
 
 	Routes []string `name:"route" env:"ROUTES" sep:" " help:"One route per occurrence: dialect|id|model|base|api-key|need-mib. Example: llama|llama/Swift-27B|qwen3.8-swift-1.5-architect|http://127.0.0.1:8001|secret|18000"`
 
@@ -272,14 +286,7 @@ func serve(ctx context.Context, cfg *config, log *slog.Logger, proxyL, adminL ne
 			log.Info("disk cache", "dir", cfg.SessionDir, "max_gib", cfg.MaxGiB, "retention_days", cfg.RetentionDays, "files", n)
 		}
 	}
-	engine.SysfsVRAM = cfg.VRAMSysfs // the card the free-VRAM gate reads
-	if cfg.VRAMSysfs == defaultVRAMSysfs {
-		// the default names card0, which on a box with an integrated GPU is not
-		// the card the engines share: find the one with the most VRAM.
-		if card := engine.DetectCard(); card != "" {
-			engine.SysfsVRAM = card
-		}
-	}
+	engine.SysfsVRAM = vramCard(cfg.VRAMSysfs, engine.DetectCard)
 	log.Info("vram gate", "card", engine.SysfsVRAM)
 	routes, err := cfg.routes()
 	if err != nil {

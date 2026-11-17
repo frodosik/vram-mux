@@ -55,15 +55,20 @@ func (l *Llama) Status(ctx context.Context) (Status, error) {
 // Fingerprint is the model name and the args the router starts it with. GET
 // /models never loads a model; /slots?model=, GET and POST /props and
 // POST /slots do, so none of them is used here.
-// stableArgs drops the arguments that change when the router restarts an
-// instance. The assigned --port is new on every load, so a fingerprint that
-// keeps it reads as a new engine after a swap and evicts every saved slot file:
-// the next request on that route re-prefills.
+//
+// stableArgs drops the arguments the router changes when it starts an instance
+// again. The assigned --port is the one this build varies, as "--port 53985" and
+// as "--port=53985"; a fingerprint that keeps it reads as a new engine after a
+// swap and evicts every saved slot file, so the next request re-prefills. A
+// trailing --port with no value ends the loop cleanly.
 func stableArgs(args []string) []string {
 	out := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
-		if args[i] == "--port" {
+		switch {
+		case args[i] == "--port":
 			i++ // its value goes with it
+			continue
+		case strings.HasPrefix(args[i], "--port="):
 			continue
 		}
 		out = append(out, args[i])
@@ -71,6 +76,9 @@ func stableArgs(args []string) []string {
 	return out
 }
 
+// Fingerprint is the model identity the session files are keyed by: the model id
+// and the arguments the instance runs with, minus what the router changes on every
+// load. A route whose fingerprint changed has no file to restore.
 func (l *Llama) Fingerprint(ctx context.Context) (string, error) {
 	e, err := l.entry(ctx)
 	if err != nil {
