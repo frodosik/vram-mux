@@ -49,6 +49,7 @@ const (
 	actBusy     = "busy"     // other requests in flight: passed through untouched
 	actUnkeyed  = "unkeyed"  // a body the cache can't key
 	actPass     = "pass"     // the engine didn't answer, or the body was too big to look at
+	actRefused  = "refused"  // the model the request named is not one this arbiter serves
 	actError    = "error"    // the cache's own logic failed
 )
 

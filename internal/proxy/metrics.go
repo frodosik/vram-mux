@@ -23,6 +23,7 @@ type Metrics struct {
 
 	mu     sync.Mutex
 	models map[string]string // route id → model, the arbiter's route table
+	reg    *prometheus.Registry
 }
 
 // NewMetrics registers the metrics with reg.
@@ -72,6 +73,9 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.saves, m.restores, m.savedBytes, m.restoredBytes, m.panics, m.swaps, m.prefillTokens,
 		m.saveSeconds, m.restoreSeconds, m.swapSeconds, m.swapBlocked, m.queue, m.resident, m.residentInfo,
 		m.lastSave, m.lastRestore)
+	if r, ok := reg.(*prometheus.Registry); ok {
+		m.reg = r
+	}
 	return m
 }
 
@@ -115,12 +119,28 @@ func (m *Metrics) prefill(tokens int) {
 }
 
 // SetRoutes is the arbiter's route table (route id → model) so resident_info can
-// name the model a route answers for. Called once, at startup, before any request.
+// name the model a route answers for. Called once, at startup, before any request:
+// every route gets its series then, so "1 for the resident, 0 for the rest" holds
+// from the first scrape, and the resident's 1 comes with the first admission.
 func (m *Metrics) SetRoutes(byRoute map[string]string) {
 	m.mu.Lock()
 	m.models = byRoute
 	m.mu.Unlock()
+	for route, model := range byRoute {
+		m.residentInfo.WithLabelValues(route, model).Set(0)
+		m.resident.WithLabelValues(route).Set(0)
+	}
 }
+
+// Request counts a generation request by what the proxy did with it, including the
+// ones it refused: a 404 is visible in the metrics, not only in the log.
+func (m *Metrics) Request(action string) {
+	m.requests.WithLabelValues(action).Inc()
+}
+
+// Registry is the registry the metrics were registered with, for a test that
+// gathers them. nil when NewMetrics got a Registerer that is not a registry.
+func (m *Metrics) Registry() *prometheus.Registry { return m.reg }
 
 // setResidentInfo writes resident_info for one route. A route the metrics have no
 // model for is skipped: the label has to name the model, not guess it.

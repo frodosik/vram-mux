@@ -170,18 +170,6 @@ func (a *Arbiter) RouteOf(model string) Route {
 	return Route{}
 }
 
-// Serves reports whether model is one of the arbiter's routes.
-func (a *Arbiter) Serves(model string) bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	_, ok := a.byModel[model]
-	return ok
-}
-
-// Strict reports that the routes were configured with --route flags, so a request
-// must name one of them.
-func (a *Arbiter) Strict() bool { return a.opt.Strict }
-
 // Resident is the route holding the card now, "" when idle.
 func (a *Arbiter) Resident() string {
 	a.mu.Lock()

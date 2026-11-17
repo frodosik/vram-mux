@@ -39,6 +39,7 @@ type Proxy struct {
 	arb     *arbiter.Arbiter
 	cache   *cache                            // nil without a store
 	proxies map[string]*httputil.ReverseProxy // by route id
+	m       *Metrics
 	maxBody int64
 	log     *slog.Logger
 
@@ -48,7 +49,7 @@ type Proxy struct {
 
 // New returns a proxy over the arbiter's routes.
 func New(opt Options) *Proxy {
-	p := &Proxy{arb: opt.Arbiter, maxBody: opt.MaxBody, log: opt.Log, proxies: map[string]*httputil.ReverseProxy{}}
+	p := &Proxy{arb: opt.Arbiter, maxBody: opt.MaxBody, m: opt.Metrics, log: opt.Log, proxies: map[string]*httputil.ReverseProxy{}}
 	if opt.Arbiter != nil {
 		p.cache = newCache(opt.Arbiter, opt.Store, opt.Metrics, opt.Log, opt.Policy)
 		// A swap ends both engines' live conversations: the arbiter says so, and the
@@ -180,45 +181,41 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "reading the request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	model := modelOf(body) // what the client asked for, read from the buffered prefix
+	// The model the client asked for, read from the buffered prefix. A body cut at
+	// the limit still gives it: in every client the model is the first key.
+	model := modelOf(body)
+	// The arbiter owns the card for every generation request, oversized ones
+	// included: this request's model is made the resident, behind the resident's
+	// queued turns, before a byte reaches a server. Forwarding an oversized body to
+	// a route that is not resident runs it on an engine whose model is not loaded,
+	// with no yield save of the conversation the card holds, beside the resident's
+	// turn. Admission is the same call for both paths.
+	rt, rel, err := p.arb.Acquire(r.Context(), model)
+	if err != nil {
+		var nr *arbiter.NoRoute
+		if errors.As(err, &nr) {
+			p.notServed(w, r, nr.Model)
+			return
+		}
+		p.log.Warn("not admitted", "model", model, "err", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"error":{"type":"server_error","code":503,"message":"the GPU is busy: `+err.Error()+`"}}`)
+		return
+	}
+	defer rel()
 	if int64(len(body)) > p.maxBody {
-		// The body is streamed through as it is, unbuffered from here, and no
-		// admission is paid for it. The route that is resident answers it, exactly
-		// as before — unless the model it names is served by another route, which
-		// gets it, or is not served at all, which is refused by the same rule as an
-		// admitted request.
+		// The body is streamed through as it is, unbuffered from here. No key, so
+		// no session copy, no restore, and the route's live-conversation belief is
+		// cleared when the request ends (finish), because the engine now holds a
+		// conversation this cache cannot name.
 		r.Body = struct {
 			io.Reader
 			io.Closer
 		}{io.MultiReader(bytes.NewReader(body), r.Body), r.Body}
-		p.cache.invalidate()
-		switch {
-		case p.arb.Serves(model):
-			t.route = p.cache.route(p.arb.RouteOf(model).ID)
-		case p.arb.Strict():
-			p.notServed(w, model)
-			return
-		default:
-			t.route = p.cache.route(p.home()) // streamed whole: the resident serves it
-		}
+		t.route = p.cache.route(rt.ID)
 	} else {
 		r.Body, r.ContentLength, r.TransferEncoding = io.NopCloser(bytes.NewReader(body)), int64(len(body)), nil
-		// The arbiter owns the card: make this request's model the resident, behind
-		// the resident's queued turns, before anything is sent to a server.
-		rt, rel, err := p.arb.Acquire(r.Context(), model)
-		if err != nil {
-			var nr *arbiter.NoRoute
-			if errors.As(err, &nr) {
-				p.notServed(w, nr.Model)
-				return
-			}
-			p.log.Warn("not admitted", "model", model, "err", err)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = io.WriteString(w, `{"error":{"type":"server_error","code":503,"message":"the GPU is busy: `+err.Error()+`"}}`)
-			return
-		}
-		defer rel()
 		t = p.cache.prepare(r.Context(), r.URL.Path, body, p.cache.route(rt.ID))
 	}
 	prepared := time.Since(start)
@@ -243,10 +240,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // notServed answers a generation request whose model this arbiter does not
 // serve, in the error shape the client reads. The arbiter's answer is the message:
-// one source for what the rule says.
-func (p *Proxy) notServed(w http.ResponseWriter, model string) {
+// one source for what the rule says. The refusal is recorded with the request, so
+// a 404 is visible in /requests and in the metrics, not only in the log.
+func (p *Proxy) notServed(w http.ResponseWriter, r *http.Request, model string) {
 	e := &arbiter.NoRoute{Model: model}
 	p.log.Warn("model not served", "model", model)
+	client, _, _ := net.SplitHostPort(r.RemoteAddr)
+	p.remember(record{At: float64(time.Now().UnixMicro()) / 1e6, Path: r.URL.Path, Client: client,
+		UserAgent: r.UserAgent(), Model: model, Action: actRefused, Route: ""})
+	if p.m != nil {
+		p.m.Request(actRefused)
+	}
 	b, _ := json.Marshal(map[string]any{"error": map[string]any{"type": "invalid_request_error",
 		"message": e.Error()}})
 	w.Header().Set("Content-Type", "application/json")
@@ -254,28 +258,39 @@ func (p *Proxy) notServed(w http.ResponseWriter, model string) {
 	_, _ = w.Write(b)
 }
 
-// home is the route a request that names no model, or cannot be keyed, belongs
-// to: the resident, and the first route when the card is idle.
-func (p *Proxy) home() string {
-	if id := p.arb.Resident(); id != "" {
-		return id
+// modelOf is the request's model name, "" when the body names none. It reads the
+// prefix, not the whole body: a body cut at --max-body-mib keeps the model, which
+// is the first key in every client's request. A strict request whose prefix names
+// no model is refused, because no route can be chosen for it; a non-strict one goes
+// to the resident, so it never triggers a swap.
+func modelOf(body []byte) string {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('{') {
+		return "" // not an object: no model to read
 	}
-	if rs := p.arb.Routes(); len(rs) > 0 {
-		return rs[0].ID
+	for dec.More() {
+		ktok, err := dec.Token()
+		if err != nil {
+			return ""
+		}
+		key, ok := ktok.(string)
+		if !ok {
+			return ""
+		}
+		if key == "model" {
+			var v string
+			if dec.Decode(&v) != nil {
+				return ""
+			}
+			return v
+		}
+		var v any // the key we want is at the top level; a nested value is skipped whole
+		if dec.Decode(&v) != nil {
+			return ""
+		}
 	}
 	return ""
-}
-
-// modelOf is the request's model name, "" when the body names none. A request
-// with no model goes to the resident route, so it never triggers a swap.
-func modelOf(body []byte) string {
-	var b struct {
-		Model string
-	}
-	if json.Unmarshal(body, &b) != nil {
-		return ""
-	}
-	return b.Model
 }
 
 // statusWriter records the status; Unwrap keeps Flush (SSE) and hijacking.

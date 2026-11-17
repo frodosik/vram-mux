@@ -142,23 +142,31 @@ Each flag can also be set through its environment variable. The flag wins.
 - `strata_diskcache_requests_total{action}`: what happened to each generation request. `continue` means it
   continued the live conversation, `ram` a switch to a parked one, `disk` a restore from file, `miss` no copy
   anywhere, `busy` other requests in flight, `unkeyed` a body it couldn't key, `pass` Strata didn't answer, `error`
-  the proxy's own failure.
-- `strata_diskcache_saves_total`, `strata_diskcache_saves_by_trigger_total{trigger=idle|switch}`,
-  `strata_diskcache_saves_skipped_total{reason}`, `strata_diskcache_restores_total`.
+  the proxy's own failure, `refused` the model it named is not served by this arbiter (a 404).
+- `strata_diskcache_saves_total`, `strata_diskcache_saves_by_trigger_total{trigger=idle|switch|yield}`,
+  `strata_diskcache_saves_skipped_total{reason}`, `strata_diskcache_restores_total`. `yield` is the save of the
+  conversation the card held when the arbiter gave the card away.
 - `strata_diskcache_saved_bytes_total`, `strata_diskcache_restored_bytes_total`, the histograms
   `strata_diskcache_save_seconds` and `strata_diskcache_restore_seconds`, `strata_diskcache_last_save_ms`,
   `strata_diskcache_last_restore_ms`.
 - `strata_diskcache_failures_total{op,reason}`, `strata_diskcache_panics_total`.
 - `strata_diskcache_evictions_total{reason}`, `strata_diskcache_evicted_bytes_total{reason}`,
   `strata_diskcache_files`, `strata_diskcache_bytes`, `strata_diskcache_max_bytes`.
+- `strata_diskcache_resident_info{route,model}`: 1 for the route holding the card and the model it answers for,
+  0 for the rest, from the first scrape. `strata_diskcache_resident_route{route}`,
+  `strata_diskcache_swaps_total`, `strata_diskcache_swap_seconds`, `strata_diskcache_swap_blocked_total{reason}`,
+  `strata_diskcache_reloads_total{route}` (a resident route loaded from cold), `strata_diskcache_queue_length`.
 
-`/requests` lists the last 256 generation requests with the client address, User-Agent and cache action. Strata
+`/requests` lists the last 256 generation requests with the client address, User-Agent, the model the request
+named, the route that answered, and the cache action; a refused request is listed with an empty route. Strata
 only sees the proxy's address, so a tracer that reads Strata's request log can join these on by path and start time.
+A request whose model was answered by a different route than the one it named is the aliasing this field shows.
 
 Logs are structured (`slog`). Every generation request gets one `request` line at info level, with the path,
-client, action, reason, tokens, how long the cache took and the whole request took, the status, and whether the
-client went away. Saves, restores, skipped saves and evictions get a line each. Prompt and answer text is never
-logged. A log file is appended to across restarts, rotated by size, gzipped, and pruned by count and age.
+client, the model named, the route that answered, action, reason, tokens, how long the cache took and the whole
+request took, the status, and whether the client went away. Saves, restores, skipped saves and evictions get a line
+each. Prompt and answer text is never logged. A log file is appended to across restarts, rotated by size, gzipped,
+and pruned by count and age.
 
 ## Limitations
 

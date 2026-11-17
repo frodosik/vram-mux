@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -27,9 +28,11 @@ import (
 // llamaFake is a llama.cpp b12445 router with two presets: it loads a model only
 // when asked, reports the presets in GET /models without loading any of them,
 // saves and restores a model's session, and answers 400 "model is not running"
-// for a model that is not resident.
+// for a model that is not resident. LoadDelay makes a load slow, as loading 19 GiB
+// of weights is on a real card.
 type llamaFake struct {
-	Dir string
+	Dir       string
+	LoadDelay time.Duration
 
 	mu      sync.Mutex
 	models  map[string]*llamaModel
@@ -117,7 +120,11 @@ func (f *llamaFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.actions = append(f.actions, "load "+body.Model)
 		m.loaded = true
+		delay := f.LoadDelay
 		f.mu.Unlock()
+		if delay > 0 {
+			time.Sleep(delay) // 19 GiB of weights take seconds
+		}
 		fmt.Fprint(w, `{"status":"loaded"}`)
 	case r.URL.Path == "/models/unload":
 		var body struct{ Model string }
@@ -211,12 +218,12 @@ func (f *llamaFake) gen(w http.ResponseWriter, r *http.Request) {
 // with a small MinTokens so the short test conversations are saved.
 func twoRouteEnv(t *testing.T) (*Proxy, *stratatest.Fake, *llamaFake, *store.Store, string, *syncBuffer, string) {
 	t.Helper()
-	return twoRouteEnvWith(t, false, 0, 10*time.Millisecond)
+	return twoRouteEnvWith(t, false, 0, 10*time.Millisecond, 64<<20)
 }
 
 // twoRouteEnvWith is the same, with strict mode (a request must name one of the
-// routes), the idle-save token cap, and the idle delay.
-func twoRouteEnvWith(t *testing.T, strict bool, maxIdle int, idle time.Duration) (*Proxy, *stratatest.Fake, *llamaFake, *store.Store, string, *syncBuffer, string) {
+// routes), the idle-save token cap, the idle delay, and the body limit.
+func twoRouteEnvWith(t *testing.T, strict bool, maxIdle int, idle time.Duration, maxBody int64) (*Proxy, *stratatest.Fake, *llamaFake, *store.Store, string, *syncBuffer, string) {
 	t.Helper()
 	dir := t.TempDir()
 	logs := &syncBuffer{}
@@ -251,7 +258,7 @@ func twoRouteEnvWith(t *testing.T, strict bool, maxIdle int, idle time.Duration)
 		PollInterval: 10 * time.Millisecond,
 		Log:          log,
 	})
-	p := New(Options{Arbiter: arb, Store: st, MaxBody: 64 << 20, Metrics: NewMetrics(prometheus.NewRegistry()), Log: log,
+	p := New(Options{Arbiter: arb, Store: st, MaxBody: maxBody, Metrics: NewMetrics(prometheus.NewRegistry()), Log: log,
 		Policy: Policy{MinTokens: 10, ParkMinTokens: -1, RegrowTokens: 0, IdleDelay: idle,
 			MaxIdleSaveTokens: maxIdle, SnapshotBytesPerToken: 64 << 10, BodyDivisor: 4,
 			MemAvailable: func() (int64, error) { return 8 << 30, nil }}})
@@ -503,7 +510,7 @@ func postBody(t *testing.T, url, body string) (int, string) {
 // the label it asked for, and its token counts, session files and the harness's
 // model name all inherit the substitution.
 func TestStrictRefusesAnUnknownModel(t *testing.T) {
-	p, _, llama, _, url, logs, _ := twoRouteEnvWith(t, true, 0, 10*time.Millisecond)
+	p, _, llama, _, url, logs, _ := twoRouteEnvWith(t, true, 0, 10*time.Millisecond, 64<<20)
 	if n := postModel(t, url, "flash", withModel("flash", conversation("A", 2))); n == 0 {
 		t.Fatal("flash turn failed")
 	}
@@ -526,12 +533,17 @@ func TestStrictRefusesAnUnknownModel(t *testing.T) {
 	if !strings.Contains(logs.String(), `"model":"ghost"`) {
 		t.Error("the log does not name the refused model")
 	}
+	// A refusal is a request: /requests shows the model asked for and the refusal.
+	rec := p.requestsJSON()
+	if !strings.Contains(rec, `"model":"ghost"`) || !strings.Contains(rec, `"diskcache":"refused"`) {
+		t.Errorf("/requests %q, want the refused model and the refusal recorded", rec)
+	}
 }
 
 // Strict mode refuses a generation request that names no model: the arbiter does
 // not choose for a client that asked for none.
 func TestStrictRefusesARequestWithNoModel(t *testing.T) {
-	p, _, _, _, url, logs, _ := twoRouteEnvWith(t, true, 0, 10*time.Millisecond)
+	p, _, _, _, url, logs, _ := twoRouteEnvWith(t, true, 0, 10*time.Millisecond, 64<<20)
 	status, body := postBody(t, url, conversation("A", 3))
 	if status != http.StatusNotFound {
 		t.Fatalf("status %d, want 404", status)
@@ -551,7 +563,7 @@ func TestStrictRefusesARequestWithNoModel(t *testing.T) {
 // skipped: a 100K-token session writes 1.4 GB in ~110 s behind the save lock, and
 // the yield save at the next switch writes the same file in ~4 s.
 func TestIdleSaveSkipsALongConversation(t *testing.T) {
-	p, _, _, _, url, logs, dir := twoRouteEnvWith(t, false, 1000, 10*time.Millisecond)
+	p, _, _, _, url, logs, dir := twoRouteEnvWith(t, false, 1000, 10*time.Millisecond, 64<<20)
 	if status, _ := postBody(t, url, withModel("flash", longBody(2000))); status != 200 {
 		t.Fatalf("status %d, want 200", status)
 	}
@@ -565,7 +577,7 @@ func TestIdleSaveSkipsALongConversation(t *testing.T) {
 // save: the idle save steps out of the way, and the switch save on that request
 // writes the file.
 func TestIdleSaveStepsOutForAQueuedRequest(t *testing.T) {
-	p, _, _, _, url, logs, dir := twoRouteEnvWith(t, false, 0, 200*time.Millisecond)
+	p, _, _, _, url, logs, dir := twoRouteEnvWith(t, false, 0, 200*time.Millisecond, 64<<20)
 	if status, _ := postBody(t, url, withModel("flash", conversation("A", 3))); status != 200 {
 		t.Fatalf("status %d", status)
 	}
@@ -605,4 +617,164 @@ func TestLearnedBytesPerTokenIsClamped(t *testing.T) {
 	if bpt != 4<<10 {
 		t.Errorf("bytes per token %d, want the 4 KB/token floor", bpt)
 	}
+}
+
+// gaugeSeries is the named gauge's samples, keyed by its labels in sorted order.
+func gaugeSeries(t *testing.T, reg *prometheus.Registry, name string) map[string]float64 {
+	t.Helper()
+	g, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]float64{}
+	for _, mf := range g {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			ls := m.GetLabel()
+			sort.Slice(ls, func(i, j int) bool { return ls[i].GetName() < ls[j].GetName() })
+			key := ""
+			for _, l := range ls {
+				key += l.GetName() + "=" + l.GetValue() + " "
+			}
+			out[strings.TrimSpace(key)] = m.GetGauge().GetValue()
+		}
+	}
+	return out
+}
+
+// The route→model table is written at startup, so every route has its
+// resident_info series from the first scrape: 0 for the routes that do not hold
+// the card, 1 for the one that does. A gauge that only appears after a route's
+// first swap leaves an operator guessing which model owns the card.
+func TestResidentInfoNamesTheModelFromTheStart(t *testing.T) {
+	p, _, _, _, url, _, _ := twoRouteEnvWith(t, true, 0, 10*time.Millisecond, 64<<20)
+	reg := p.m.Registry()
+	want := map[string]float64{"model=flash route=strata/flash": 0, "model=swift route=llama/swift": 0}
+	got := gaugeSeries(t, reg, "strata_diskcache_resident_info")
+	if len(got) != len(want) {
+		t.Fatalf("series %v, want both routes named before any request", got)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s = %v, want %v", k, got[k], v)
+		}
+	}
+	if n := postModel(t, url, "flash", withModel("flash", conversation("A", 2))); n == 0 {
+		t.Fatal("flash turn failed")
+	}
+	got = gaugeSeries(t, reg, "strata_diskcache_resident_info")
+	if got["model=flash route=strata/flash"] != 1 {
+		t.Errorf("the resident gauge is %v, want 1 for the route holding the card", got["model=flash route=strata/flash"])
+	}
+	if got["model=swift route=llama/swift"] != 0 {
+		t.Errorf("the idle route's gauge is %v, want 0", got["model=swift route=llama/swift"])
+	}
+}
+
+// A generation body over --max-body-mib is streamed through unbuffered, and it
+// pays admission like any request: the model in its prefix is made the resident
+// before the bytes reach a server, so a request never runs on a route whose model
+// is not loaded, and the conversation the card holds is yielded by the swap.
+// The model is read from the prefix, so a body cut at the limit is still routed.
+func TestOversizedBodyIsAdmittedToItsRoute(t *testing.T) {
+	p, strata, llama, _, url, _, _ := twoRouteEnvWith(t, true, 0, 10*time.Millisecond, 4096)
+	if status, _ := postBody(t, url, withModel("flash", conversation("A", 3))); status != 200 {
+		t.Fatalf("status %d, want 200", status)
+	}
+	body := withModel("swift", longBody(1500)) // ~7.5 KB: over the 4 KiB limit
+	if len(body) <= 4096 {
+		t.Fatalf("test body is %d bytes, want over the limit", len(body))
+	}
+	if status, _ := postBody(t, url, body); status != 200 {
+		t.Fatalf("status %d, want 200", status)
+	}
+	if p.Resident() != "llama/swift" {
+		t.Errorf("resident %q, want the card moved to the model the body named", p.Resident())
+	}
+	if acts := llama.Take(); len(acts) < 2 || acts[0] != "load swift" {
+		t.Fatalf("llama actions %v, want the load before the request", acts)
+	}
+	got := llama.Bodies()
+	if len(got) != 1 || len(got[0]) != len(body) {
+		t.Errorf("the engine got %d bytes of the body, want all %d streamed through", len(got), len(body))
+	}
+	if strata.Loaded {
+		t.Error("Strata is still resident: the card did not move")
+	}
+}
+
+// The oversized path is the same rule: a model the arbiter does not serve is
+// refused, not answered by the resident. Its name is in the prefix the proxy read.
+func TestStrictOversizedBodyIsRefusedByTheSameRule(t *testing.T) {
+	p, _, llama, _, url, logs, _ := twoRouteEnvWith(t, true, 0, 10*time.Millisecond, 4096)
+	if status, _ := postBody(t, url, withModel("flash", conversation("A", 2))); status != 200 {
+		t.Fatalf("status %d, want 200", status)
+	}
+	status, body := postBody(t, url, withModel("ghost", longBody(1500)))
+	if status != http.StatusNotFound {
+		t.Fatalf("status %d, want 404", status)
+	}
+	if !strings.Contains(body, "model ghost is not served by this arbiter") {
+		t.Errorf("body %q, want the refused model named", body)
+	}
+	if llama.Take() != nil {
+		t.Error("a refused oversized body touched the other engine")
+	}
+	if p.Resident() != "strata/flash" {
+		t.Errorf("resident %q, want flash untouched", p.Resident())
+	}
+	if !strings.Contains(logs.String(), `"model":"ghost"`) {
+		t.Error("the log does not name the refused model")
+	}
+}
+
+// The queue the arbiter observes is what makes a background save step out of the
+// way. The wiring, not a direct call: a slow load keeps one admission running, the
+// next request for that route is queued, and the idle save fires while the queue
+// is not empty, so it skips and the switch save on the queued request writes the
+// file.
+func TestQueueWiringMakesTheIdleSaveStepOut(t *testing.T) {
+	p, _, llama, _, url, logs, dir := twoRouteEnvWith(t, false, 0, 250*time.Millisecond, 64<<20)
+	llama.LoadDelay = 400 * time.Millisecond
+	if status, _ := postBody(t, url, withModel("flash", conversation("A", 3))); status != 200 {
+		t.Fatalf("status %d, want 200", status)
+	}
+	send := func(model, body string) <-chan int {
+		ch := make(chan int, 1)
+		go func() {
+			req, _ := http.NewRequest(http.MethodPost, url+"/v1/chat/completions",
+				strings.NewReader(withModel(model, body)))
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				ch <- 0
+				return
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			ch <- resp.StatusCode
+		}()
+		return ch
+	}
+	// B takes the card: its admission runs for the length of the load. C queues
+	// behind it, inside the idle delay, so the queue is not empty when the
+	// background save for flash's turn fires.
+	b, c := send("swift", conversation("B", 2)), send("swift", conversation("C", 2))
+	time.Sleep(120 * time.Millisecond)
+	c2 := send("swift", conversation("D", 2))
+	eventually(t, "the skip", func() bool { return strings.Contains(logs.String(), `"reason":"queue_busy"`) })
+	if status := <-b; status != 200 {
+		t.Errorf("B's status %d, want 200", status)
+	}
+	for _, ch := range []<-chan int{c, c2} {
+		if status := <-ch; status != 200 {
+			t.Errorf("a queued turn's status %d, want 200", status)
+		}
+	}
+	if n := count(llama.Take(), "load swift"); n != 1 {
+		t.Errorf("%d loads of the 27B route, want exactly one", n)
+	}
+	// The background save never ran; the switch save on B's admission did.
+	eventually(t, "flash's file from the switch save", func() bool { return len(filesIn(t, p, "strata/flash", dir)) == 1 })
 }

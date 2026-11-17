@@ -22,7 +22,12 @@
   and an idle save is skipped while a request is queued for the card: the 1.4 GB a 100K-token
   session writes takes ~110 s behind the save lock, and the yield save at the switch writes the
   same file in ~4 s.
-- `strata_diskcache_resident_info{route,model}` shows which model owns the card.
+- `strata_diskcache_resident_info{route,model}` shows which model owns the card, with every route's series
+  written at startup, so the gauge reads 0 for an idle route from the first scrape.
+- A generation body over `--max-body-mib` is admitted through the same `Acquire` as any request: the model in
+  its prefix is made the resident before the bytes reach a server, so an oversized request never runs on a route
+  whose model is not loaded. The model is read from the prefix (a truncated body keeps it), and a refusal is
+  recorded in `/requests` and in `requests_total{action="refused"}`.
 
 - **Flags take two dashes** (`--session-dir`, not `-session-dir`). The environment variables are unchanged.
 - `go install` path is now `github.com/tfyl/strata-diskcache/cmd/strata-diskcache@latest`.

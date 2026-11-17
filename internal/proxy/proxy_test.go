@@ -833,3 +833,29 @@ func TestSingleRouteLogsTheRequestedModel(t *testing.T) {
 		t.Error("/requests does not show the requested model")
 	}
 }
+
+// modelOf reads the model from a truncated prefix: a body cut at --max-body-mib
+// keeps it, because it is the first key. A body that names none, a model that is
+// not a string, and a body that is not an object all read as no model.
+func TestModelOfReadsATruncatedPrefix(t *testing.T) {
+	full := `{"model":"swift","stream":true,"messages":[{"role":"user","content":"u"}]}`
+	if got := modelOf([]byte(full)); got != "swift" {
+		t.Errorf("whole body: %q, want swift", got)
+	}
+	cut := `{"model":"swift","str` // the body cut mid-value, after the model
+	if got := modelOf([]byte(cut)); got != "swift" {
+		t.Errorf("truncated prefix %q: %q, want swift", cut, got)
+	}
+	if got := modelOf([]byte(`{"stream":true,"messages":[]}`)); got != "" {
+		t.Errorf("no model: %q, want empty", got)
+	}
+	if got := modelOf([]byte(`{"model":123}`)); got != "" {
+		t.Errorf("model is not a string: %q, want empty", got)
+	}
+	if got := modelOf([]byte(`[1,2]`)); got != "" {
+		t.Errorf("not an object: %q, want empty", got)
+	}
+	if got := modelOf([]byte(`{"tools":[{"model":"x"}],"stream":true}`)); got != "" {
+		t.Errorf("nested model key: %q, want empty: only the top level names the model", got)
+	}
+}
