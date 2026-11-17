@@ -102,6 +102,33 @@ func (c *cache) route(id string) *route {
 	return c.routes[id]
 }
 
+// Swap is the arbiter's note that the card moved. The route that gave the card
+// away has no live conversation and nothing parked, and the route taking it has
+// just been loaded, so its belief is stale too. Clear both, so the next request
+// is decided from the session files and not from a conversation the engine no
+// longer holds: llama.cpp's router reports no start time, so the restart check
+// cannot see a model that was unloaded and loaded again.
+func (c *cache) Swap(from, to string, _ float64) {
+	c.mu.Lock()
+	for _, id := range []string{from, to} {
+		if r := c.routes[id]; r != nil {
+			r.live, r.liveTokens, r.ram = nil, 0, nil
+		}
+	}
+	c.mu.Unlock()
+}
+
+// Reloaded is the arbiter's note that a route's model was loaded from cold: the
+// engine it starts with holds no conversation, so a continuation is not possible
+// and the restore path is the one that can help.
+func (c *cache) Reloaded(route string) {
+	c.mu.Lock()
+	if r := c.routes[route]; r != nil {
+		r.live, r.liveTokens, r.ram = nil, 0, nil
+	}
+	c.mu.Unlock()
+}
+
 // newCache builds the cache over the arbiter's routes. Without a store, there is
 // nothing to cache and the proxy is a plain forwarder.
 func newCache(arb *arbiter.Arbiter, files *store.Store, m *Metrics, log *slog.Logger, pol Policy) *cache {
@@ -422,9 +449,15 @@ func (c *cache) save(ctx context.Context, r *route, fp string, live []string, to
 		return
 	}
 	c.m.saved(trigger, e.Size, d)
-	c.mu.Lock()
-	r.bpt = e.Size / int64(e.Tokens)
-	c.mu.Unlock()
+	// A small conversation's file is mostly fixed overhead, so its bytes-per-token
+	// is not the figure for the next reserve: learning 3 MB/token from a 74-token
+	// save makes a 168K-token session look like it cannot fit, and the save is
+	// skipped. Only a save of a conversation worth saving sets the estimate.
+	if e.Tokens >= c.pol.MinTokens {
+		c.mu.Lock()
+		r.bpt = e.Size / int64(e.Tokens)
+		c.mu.Unlock()
+	}
 	c.log.Info("save", "route", r.id, "trigger", trigger, "tokens", e.Tokens, "mb", e.Size>>20, "ms", d.Milliseconds())
 }
 

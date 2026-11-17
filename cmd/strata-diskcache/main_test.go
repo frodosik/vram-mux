@@ -192,7 +192,7 @@ func TestBootWiring(t *testing.T) {
 				_, _ = w.Write([]byte(`{"success":true}`))
 				return
 			}
-			_, _ = w.Write([]byte(`{"models":[{"id":"swift","status":{"value":"loaded"},"args":["--model","swift.gguf"]}]}`))
+			_, _ = w.Write([]byte(`{"data":[{"id":"swift","status":{"value":"loaded","args":["--model","swift.gguf"]}}]}`))
 		case "/models/load":
 			llamaCalls = append(llamaCalls, "load")
 			_, _ = w.Write([]byte(`{"success":true}`))

@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 )
@@ -30,13 +29,17 @@ func (l *Llama) ID() string { return l.cl.id }
 // Model is the model name a client puts in its request.
 func (l *Llama) Model() string { return l.cl.model }
 
-// modelEntry is one entry of the router's GET /models answer.
+// modelEntry is one entry of the router's GET /models answer. The router reports
+// the preset's args inside status; a build naming them top level is read too.
 type modelEntry struct {
-	ID     string `json:"id"`
+	ID     string   `json:"id"`
+	Args   []string `json:"args"`
 	Status struct {
-		Value string `json:"value"` // "loaded", "unloaded"
+		Value    string   `json:"value"` // "unloaded", "loading", "loaded"
+		Args     []string `json:"args"`
+		Failed   bool     `json:"failed"`
+		ExitCode int      `json:"exit_code"`
 	} `json:"status"`
-	Args []string `json:"args"` // the router's own command line for this preset
 }
 
 // Status reads GET /models: it is the only endpoint that reports a model without
@@ -52,12 +55,32 @@ func (l *Llama) Status(ctx context.Context) (Status, error) {
 // Fingerprint is the model name and the args the router starts it with. GET
 // /models never loads a model; /slots?model=, GET and POST /props and
 // POST /slots do, so none of them is used here.
+// stableArgs drops the arguments that change when the router restarts an
+// instance. The assigned --port is new on every load, so a fingerprint that
+// keeps it reads as a new engine after a swap and evicts every saved slot file:
+// the next request on that route re-prefills.
+func stableArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--port" {
+			i++ // its value goes with it
+			continue
+		}
+		out = append(out, args[i])
+	}
+	return out
+}
+
 func (l *Llama) Fingerprint(ctx context.Context) (string, error) {
 	e, err := l.entry(ctx)
 	if err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256([]byte(e.ID + "|" + strings.Join(e.Args, " ")))
+	args := e.Args
+	if len(args) == 0 {
+		args = e.Status.Args
+	}
+	sum := sha256.Sum256([]byte(e.ID + "|" + strings.Join(stableArgs(args), " ")))
 	return hex.EncodeToString(sum[:6]), nil
 }
 
@@ -80,14 +103,20 @@ func (l *Llama) Save(ctx context.Context, name string) (int, int64, error) {
 	return l.slot(ctx, "save", name)
 }
 
-// Restore makes name the live conversation. The router's action is "load", not
-// "restore".
+// Restore makes name the live conversation. The router's action is "restore" —
+// "load" is refused as Invalid action — and the filename is a basename inside the
+// router's slot-save path; an absolute path is refused as Invalid filename. A full
+// slot restore measured 821 MB in 1.26 s (n_restored 8252).
 func (l *Llama) Restore(ctx context.Context, name string) (int, int64, error) {
-	return l.slot(ctx, "load", name)
+	return l.slot(ctx, "restore", name)
 }
 
+// llama.cpp wants the model name and the file name in the JSON body: a slot call
+// without the model in the body is a 400, and one naming the model only in the
+// query asks for a JSON body.
 func (l *Llama) slot(ctx context.Context, action, name string) (int, int64, error) {
-	raw, err := l.cl.slot(ctx, "/slots/0?action="+action+"&model="+url.QueryEscape(l.cl.model), name)
+	raw, err := l.cl.slotBody(ctx, "/slots/0?action="+action,
+		map[string]string{"model": l.cl.model, "filename": name})
 	if err != nil {
 		return 0, 0, err
 	}
@@ -95,12 +124,57 @@ func (l *Llama) slot(ctx context.Context, action, name string) (int, int64, erro
 	return tokens, size, nil
 }
 
-// Load loads this model into a free slot.
+// Load loads this model into a free slot and waits until the instance serves.
+// POST /models/load is answered at once and the instance starts in the
+// background; forwarding a request to a starting instance gets a connection
+// error, so the arbiter must not call the route resident until GET /models says
+// loaded. An instance that dies mid-start reports failed with its exit code, and
+// a model that is already resident is a load that succeeded earlier.
 func (l *Llama) Load(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, l.cl.timeout)
+	ctx, cancel := context.WithTimeout(ctx, l.cl.loadWindow())
 	defer cancel()
 	_, err := l.cl.postJSON(ctx, "/models/load", modelBody(l.cl.model))
-	return err
+	if err != nil {
+		var se *SlotError
+		// "model is already running" is the router saying the model is resident:
+		// a swap back to a model that was never evicted is a success, not a refusal.
+		if !errors.As(err, &se) || se.Status != http.StatusBadRequest ||
+			!strings.Contains(strings.ToLower(se.Message), "model is already running") {
+			return err
+		}
+	}
+	return l.waitLoaded(ctx)
+}
+
+// loadPoll is how often the router's model list is re-read while an instance
+// starts. A model of 11 GB takes a while to map, and the read is 3 s at most.
+var loadPoll = time.Second
+
+func (l *Llama) waitLoaded(ctx context.Context) error {
+	for {
+		e, err := l.entry(ctx)
+		if ctx.Err() != nil {
+			// the card was given the whole load timeout and the instance is
+			// still not serving: say so, whatever the last read answered
+			return fmt.Errorf("engine: %s is not loaded: %w", l.cl.model, ctx.Err())
+		}
+		if err != nil {
+			return err
+		}
+		switch {
+		case e.Status.Value == "loaded":
+			return nil
+		case e.Status.Failed:
+			return fmt.Errorf("engine: %s failed to start (exit code %d)", l.cl.model, e.Status.ExitCode)
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("engine: %s is not loaded: %w", l.cl.model, ctx.Err())
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(loadPoll):
+		}
+	}
 }
 
 // Unload gives this model's VRAM back. The router has no drain wait, so wait

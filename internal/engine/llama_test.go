@@ -31,6 +31,11 @@ type llamaMock struct {
 	slotBody                             string // the success body; default llama's save answer
 	loadStatus, unloadStatus, wakeStatus int
 
+	loadStays  bool // load answered success, the instance keeps reporting unloaded
+	loadFailed bool // load answered success, the instance died on start
+	loadBusy   bool // load refused: the model is already running
+	exitCode   int  // the exit code a failed instance reports
+
 	reqs []llamaRec
 }
 
@@ -83,12 +88,18 @@ func (m *llamaMock) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/models":
 		var v struct {
-			Data []entry `json:"data"`
+			Data []modelEntry `json:"data"`
 		}
 		for _, e := range m.models {
-			v.Data = append(v.Data, entry{ID: e.id, Args: e.args, Status: struct {
-				Value string `json:"value"`
-			}{e.value}})
+			var me modelEntry
+			me.ID = e.id
+			me.Status.Value = e.value
+			me.Status.Args = e.args
+			if m.loadFailed {
+				me.Status.Failed = true
+				me.Status.ExitCode = m.exitCode
+			}
+			v.Data = append(v.Data, me)
 		}
 		b, _ := json.Marshal(v)
 		_, _ = io.WriteString(w, string(b))
@@ -108,10 +119,29 @@ func (m *llamaMock) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_, _ = io.WriteString(w, body)
 	case r.Method == http.MethodPost && r.URL.Path == "/models/load":
+		if m.loadBusy {
+			// "already running" means the model is resident: the list says loaded
+			want := modelName(raw)
+			for i := range m.models {
+				if m.models[i].id == want {
+					m.models[i].value = "loaded"
+				}
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"code":400,"message":"model is already running"}}`)
+			return
+		}
 		if m.loadStatus != 0 {
 			w.WriteHeader(m.loadStatus)
 			_, _ = io.WriteString(w, `{"error":"the model does not fit in VRAM"}`)
 			return
+		}
+		// the router answers at once; the instance starts in the background
+		want := modelName(raw)
+		for i := range m.models {
+			if m.models[i].id == want && !m.loadStays {
+				m.models[i].value = "loaded"
+			}
 		}
 		_, _ = io.WriteString(w, `{"success":true}`)
 	case r.Method == http.MethodPost && r.URL.Path == "/models/unload":
@@ -140,13 +170,13 @@ func (m *llamaMock) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// entry is one line of the router's GET /models answer.
-type entry struct {
-	ID     string   `json:"id"`
-	Args   []string `json:"args"`
-	Status struct {
-		Value string `json:"value"`
-	} `json:"status"`
+// modelName is the model a POST /models/load|unload body names.
+func modelName(raw []byte) string {
+	var v struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(raw, &v)
+	return v.Model
 }
 
 func TestLlamaStatus(t *testing.T) {
@@ -258,11 +288,11 @@ func TestLlamaSaveRestore(t *testing.T) {
 			t.Errorf("content type: %q", r.ctype)
 		}
 	}
-	if reqs[0].path != "/slots/0" || reqs[0].query != "action=save&model=Swift-27B" ||
-		reqs[0].body != `{"filename":"dc-abc-123.session"}` {
+	if reqs[0].path != "/slots/0" || reqs[0].query != "action=save" ||
+		reqs[0].body != `{"filename":"dc-abc-123.session","model":"Swift-27B"}` {
 		t.Errorf("save call: %s?%s %s", reqs[0].path, reqs[0].query, reqs[0].body)
 	}
-	if reqs[1].path != "/slots/0" || reqs[1].query != "action=load&model=Swift-27B" {
+	if reqs[1].path != "/slots/0" || reqs[1].query != "action=restore" {
 		t.Errorf("restore call: %s?%s", reqs[1].path, reqs[1].query)
 	}
 }
@@ -334,8 +364,11 @@ func TestLlamaLoadUnload(t *testing.T) {
 	if reqs[0].path != "/models/load" || reqs[0].body != `{"model":"Swift-27B"}` {
 		t.Errorf("load call: %s %s", reqs[0].path, reqs[0].body)
 	}
-	if reqs[1].path != "/models/unload" || reqs[1].body != `{"model":"Swift-27B"}` {
-		t.Errorf("unload call: %s %s", reqs[1].path, reqs[1].body)
+	if reqs[1].path != "/models" || reqs[1].method != http.MethodGet {
+		t.Errorf("Load must read the model list, not trust the load answer: %s %s", reqs[1].method, reqs[1].path)
+	}
+	if reqs[2].path != "/models/unload" || reqs[2].body != `{"model":"Swift-27B"}` {
+		t.Errorf("unload call: %s %s", reqs[2].path, reqs[2].body)
 	}
 	for _, r := range reqs {
 		if r.path == "/unload" || r.path == "/model" {
@@ -357,6 +390,91 @@ func TestLlamaLoadUnload(t *testing.T) {
 	m.update(func(m *llamaMock) { m.loadStatus = http.StatusInternalServerError })
 	if err := e.Load(ctx); err == nil {
 		t.Error("a refused load accepted")
+	}
+}
+
+func TestLlamaLoadWaitsForTheInstance(t *testing.T) {
+	m := newLlamaMock()
+	srv := httptest.NewServer(m)
+	defer srv.Close()
+	e := NewLlama(Options{ID: "llama/Swift-27B", Model: "Swift-27B", Base: srv.URL, Timeout: 2 * time.Second})
+	old := loadPoll
+	loadPoll = 10 * time.Millisecond
+	defer func() { loadPoll = old }()
+
+	m.update(func(m *llamaMock) { m.loadStays = true }) // the router answers at once; the instance is still starting
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	if err := e.Load(ctx); err == nil || !strings.Contains(err.Error(), "not loaded") {
+		t.Errorf("a load that never became resident accepted: %v", err)
+	}
+	reqs := m.requests()
+	if reqs[0].path != "/models/load" {
+		t.Errorf("load call: %s", reqs[0].path)
+	}
+	if n := len(reqs); n < 3 {
+		t.Errorf("the model list was read %d times while the instance started", n)
+	}
+}
+
+func TestLlamaLoadReportsAFailedInstance(t *testing.T) {
+	m := newLlamaMock()
+	srv := httptest.NewServer(m)
+	defer srv.Close()
+	e := NewLlama(Options{ID: "llama/Swift-27B", Model: "Swift-27B", Base: srv.URL})
+	old := loadPoll
+	loadPoll = 10 * time.Millisecond
+	defer func() { loadPoll = old }()
+
+	m.update(func(m *llamaMock) { m.loadStays, m.loadFailed, m.exitCode = true, true, 1 })
+	if err := e.Load(context.Background()); err == nil || !strings.Contains(err.Error(), "exit code 1") {
+		t.Errorf("a dead instance: %v", err)
+	}
+}
+
+// A swap back to a model that was never evicted: the router refuses the load as
+// already running, which is the load having succeeded. Treating it as a failure
+// wedges the queue: the request gets 503 and the card never moves.
+func TestLlamaLoadOfARunningModelIsASuccess(t *testing.T) {
+	m := newLlamaMock()
+	srv := httptest.NewServer(m)
+	defer srv.Close()
+	e := NewLlama(Options{ID: "llama/Swift-27B", Model: "Swift-27B", Base: srv.URL})
+	m.update(func(m *llamaMock) { m.loadBusy = true })
+	if err := e.Load(context.Background()); err != nil {
+		t.Errorf("a model already running: %v", err)
+	}
+}
+
+// The router assigns a new port on every load. A fingerprint that keeps the port
+// reads as a new engine after a swap and evicts the route's saved slot files, so
+// the next request re-prefills. The port must not be part of the identity.
+func TestLlamaFingerprintIgnoresThePort(t *testing.T) {
+	m := newLlamaMock()
+	srv := httptest.NewServer(m)
+	defer srv.Close()
+	e := NewLlama(Options{ID: "llama/Swift-27B", Model: "Swift-27B", Base: srv.URL})
+	m.update(func(m *llamaMock) {
+		m.models[0].value = "loaded"
+		m.models[0].args = []string{"/models/swift.gguf", "--port", "53985", "--ctx-size", "229376"}
+	})
+	first, err := e.Fingerprint(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.update(func(m *llamaMock) {
+		m.models[0].args = []string{"/models/swift.gguf", "--port", "54001", "--ctx-size", "229376"}
+	})
+	second, err := e.Fingerprint(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Errorf("a reload on a new port read as a new engine: %s vs %s", first, second)
+	}
+	m.update(func(m *llamaMock) { m.models[0].args = []string{"/models/swift.gguf", "--port", "54001", "--ctx-size", "131072"} })
+	if third, err := e.Fingerprint(context.Background()); err != nil || third == first {
+		t.Errorf("a context change must change the fingerprint, got %s vs %s (err %v)", third, first, err)
 	}
 }
 

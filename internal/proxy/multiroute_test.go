@@ -148,9 +148,13 @@ func (f *llamaFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *llamaFake) slot(w http.ResponseWriter, r *http.Request) {
-	var body struct{ Filename string }
+	var body struct{ Filename, Model string }
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	action, model := r.URL.Query().Get("action"), r.URL.Query().Get("model")
+	// llama.cpp names the model in the body, not in the query
+	action, model := r.URL.Query().Get("action"), body.Model
+	if model == "" {
+		model = r.URL.Query().Get("model")
+	}
 	m := f.models[model]
 	if m == nil {
 		f.mu.Unlock()
@@ -298,6 +302,30 @@ func TestTwoRoutesShareOneSessionFolder(t *testing.T) {
 	}
 	if strata.Loaded {
 		t.Error("Strata is still resident: the card did not move")
+	}
+}
+
+// A route that gave the card away holds no live conversation, so its next request
+// must restore the session file. llama.cpp's router reports no start time, so the
+// cache cannot see that the model was unloaded and loaded again; the arbiter's
+// swap note is what tells it.
+func TestSwapBackRestoresTheFile(t *testing.T) {
+	p, _, _, _, url, _, dir := twoRouteEnv(t)
+
+	postModel(t, url, "flash", withModel("flash", conversation("A", 3)))
+	eventually(t, "flash's file", func() bool { return len(filesIn(t, p, "strata/flash", dir)) == 1 })
+	postModel(t, url, "swift", withModel("swift", conversation("B", 3)))
+	eventually(t, "swift's file", func() bool { return len(filesIn(t, p, "llama/swift", dir)) == 1 })
+
+	// The card goes back to flash and then to Swift. Swift's engine was unloaded
+	// and loaded again, so its conversation is on disk, not in the engine.
+	postModel(t, url, "flash", withModel("flash", conversation("A", 3)))
+	postModel(t, url, "swift", withModel("swift", conversation("B", 3)))
+	p.mu.Lock()
+	last := p.recent[len(p.recent)-1].Action
+	p.mu.Unlock()
+	if last != "disk" {
+		t.Errorf("Swift after a swap back: action %q, want disk", last)
 	}
 }
 

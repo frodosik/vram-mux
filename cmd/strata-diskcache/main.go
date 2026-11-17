@@ -35,6 +35,10 @@ import (
 // version is set at build time: -ldflags "-X main.version=v1.2.3".
 var version = "dev"
 
+// defaultVRAMSysfs is the --vram-sysfs default, kept here so the code can tell
+// "the operator named a card" from "the card has to be found".
+const defaultVRAMSysfs = "/sys/class/drm/card0/device"
+
 // config is the command line. Every flag can also be set by its environment
 // variable; the flag wins.
 type config struct {
@@ -165,11 +169,12 @@ func (c *config) routes() ([]arbiter.Route, error) {
 		if err != nil || u.Scheme == "" || u.Host == "" {
 			return nil, fmt.Errorf("route %q: base must be a URL like http://127.0.0.1:8001", r.ID)
 		}
+		load := time.Duration(c.LoadTimeoutS * float64(time.Second))
 		switch r.Dialect {
 		case "strata":
-			out[i].Engine = engine.NewStrata(engine.Options{ID: r.ID, Model: r.Model, Base: r.Base, APIKey: r.APIKey})
+			out[i].Engine = engine.NewStrata(engine.Options{ID: r.ID, Model: r.Model, Base: r.Base, APIKey: r.APIKey, LoadTimeout: load})
 		case "llama":
-			out[i].Engine = engine.NewLlama(engine.Options{ID: r.ID, Model: r.Model, Base: r.Base, APIKey: r.APIKey})
+			out[i].Engine = engine.NewLlama(engine.Options{ID: r.ID, Model: r.Model, Base: r.Base, APIKey: r.APIKey, LoadTimeout: load})
 		}
 	}
 	return out, nil
@@ -268,6 +273,14 @@ func serve(ctx context.Context, cfg *config, log *slog.Logger, proxyL, adminL ne
 		}
 	}
 	engine.SysfsVRAM = cfg.VRAMSysfs // the card the free-VRAM gate reads
+	if cfg.VRAMSysfs == defaultVRAMSysfs {
+		// the default names card0, which on a box with an integrated GPU is not
+		// the card the engines share: find the one with the most VRAM.
+		if card := engine.DetectCard(); card != "" {
+			engine.SysfsVRAM = card
+		}
+	}
+	log.Info("vram gate", "card", engine.SysfsVRAM)
 	routes, err := cfg.routes()
 	if err != nil {
 		return err

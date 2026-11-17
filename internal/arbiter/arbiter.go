@@ -32,11 +32,22 @@ type Route struct {
 	Engine    engine.Engine
 }
 
+// SetObservers installs the observer after construction: the cache is built over
+// the arbiter, so a wire that needs both can only be made afterwards.
+func (a *Arbiter) SetObservers(o Observers) {
+	a.mu.Lock()
+	a.opt.Observers = o
+	a.mu.Unlock()
+}
+
 // Observers reports swaps to the metrics; optional.
 type Observers interface {
 	Swap(from, to string, seconds float64)
 	SwapBlocked(reason string)
 	Queue(n int, resident string)
+	// Reloaded says the resident route's model was loaded from cold, so what the
+	// engine held for the last conversation is gone.
+	Reloaded(route string)
 }
 
 // Options configure the arbiter.
@@ -204,6 +215,12 @@ func (a *Arbiter) Acquire(ctx context.Context, model string) (Route, func(), err
 					a.cond.Broadcast()
 					return Route{}, nil, w.err
 				}
+			} else if w.err = a.ensureLoaded(ctx, r); w.err != nil {
+				a.unqueue(w)
+				a.busy = false
+				a.observe()
+				a.cond.Broadcast()
+				return Route{}, nil, w.err
 			}
 			break
 		}
@@ -257,6 +274,33 @@ func (a *Arbiter) pick() *waiter {
 	// too, or it parks in cond.Wait forever.
 	a.cond.Broadcast()
 	return winner
+}
+
+// ensureLoaded loads the resident route's model when it is not resident: the
+// router's idle sleep, a dead engine, or a swap that was refused after the
+// unload, all leave the arbiter's resident route with nothing to answer. The
+// gate is the same as a swap's: the load must fit.
+func (a *Arbiter) ensureLoaded(ctx context.Context, r Route) error {
+	if st, err := r.Engine.Status(ctx); err == nil && st.Loaded {
+		return nil
+	}
+	if err := a.waitForVRAM(ctx, r); err != nil {
+		a.blocked("vram")
+		a.log().Warn("not enough VRAM free to reload", "route", r.ID, "need", r.Need, "margin", a.opt.VRAMMargin, "err", err)
+		return err
+	}
+	if err := r.Engine.Load(ctx); err != nil {
+		a.blocked("load")
+		// Fail open: an engine that cannot load answers its own reason, and that is
+		// the client's best answer. The admission is not refused on a failed load.
+		a.log().Warn("reload refused; the request goes to the engine", "route", r.ID, "err", err)
+		return nil
+	}
+	if a.opt.Observers != nil {
+		a.opt.Observers.Reloaded(r.ID)
+	}
+	a.log().Info("resident model reloaded", "route", r.ID)
+	return nil
 }
 
 // swap gives the card to to. The order is fixed: save what the resident holds,

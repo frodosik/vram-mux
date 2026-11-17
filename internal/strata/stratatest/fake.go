@@ -31,6 +31,8 @@ type Fake struct {
 	SlotKind     string        // with this kind
 	SlotMessage  string        // with this message ("refused" when empty)
 	SlotDelay    time.Duration // save/restore take this long
+	SaveBytes    int           // bytes a save writes; 0: 1000
+	SavedTokens  int           // what a save/restore answers; 0: Tokens
 	LoadDelay    time.Duration // /v1/load takes this long
 	UnloadDelay  time.Duration // /v1/unload takes this long
 	LoadStatus   int           // non-zero: /v1/load answers this status
@@ -165,6 +167,9 @@ func (f *Fake) slot(w http.ResponseWriter, r *http.Request) {
 	action := r.URL.Query().Get("action")
 	f.actions = append(f.actions, action+" "+b.Filename)
 	status, kind, delay, tokens, entered := f.SlotStatus, f.SlotKind, f.SlotDelay, f.Tokens, f.entered
+	if f.SavedTokens > 0 {
+		tokens = f.SavedTokens // the engine's own count of what it wrote
+	}
 	msg := f.SlotMessage
 	if msg == "" {
 		msg = "refused"
@@ -184,7 +189,11 @@ func (f *Fake) slot(w http.ResponseWriter, r *http.Request) {
 	}
 	p := filepath.Join(f.Dir, b.Filename)
 	if action == "save" {
-		_ = os.WriteFile(p, make([]byte, 1000), 0o600)
+		n := f.SaveBytes
+		if n <= 0 {
+			n = 1000
+		}
+		_ = os.WriteFile(p, make([]byte, n), 0o600)
 		fmt.Fprintf(w, `{"n_saved":%d,"n_written":1000}`, tokens)
 		return
 	}

@@ -63,7 +63,7 @@ func setup(t *testing.T, idle time.Duration, maxBody int64) *env {
 	if err := e.st.Load(); err != nil {
 		t.Fatal(err)
 	}
-	e.p = New(Options{Arbiter: oneRoute(up.URL, "test-model"), Store: e.st, MaxBody: maxBody,
+	e.p = New(Options{Arbiter: oneRoute(up.URL, "test-model", log), Store: e.st, MaxBody: maxBody,
 		Metrics: NewMetrics(prometheus.NewRegistry()), Log: log,
 		Policy: Policy{MinTokens: 15000, ParkMinTokens: -1, RegrowTokens: 4096, IdleDelay: idle,
 			SnapshotBytesPerToken: 64 << 10, BodyDivisor: 4,
@@ -75,16 +75,17 @@ func setup(t *testing.T, idle time.Duration, maxBody int64) *env {
 }
 
 // oneRoute is the arbiter over a single route, with no VRAM gate. The route is
-// resident from the start and its engine is left as it is: a --lazy Strata takes
-// its model on the first request, so the cache's cold-engine path stays reachable.
-func oneRoute(base, model string) *arbiter.Arbiter {
+// resident from the start. A --lazy Strata takes its model on the first request,
+// so a cold engine is loaded by the arbiter at admission and the cache's restore
+// path stays reachable.
+func oneRoute(base, model string, log *slog.Logger) *arbiter.Arbiter {
 	id := "strata/" + model
 	return arbiter.New(arbiter.Options{
 		Routes: []arbiter.Route{{ID: id, Dialect: "strata", Model: model, Base: base,
 			Namespace: store.NamespaceOf("strata", model),
 			Engine:    engine.NewStrata(engine.Options{ID: id, Model: model, Base: base})}},
 		InitialResident: id,
-		Log:             slog.New(slog.NewJSONHandler(io.Discard, nil)),
+		Log:             log,
 		VRAMFree:        func() (int64, error) { return 1 << 40, nil },
 	})
 }
@@ -489,40 +490,38 @@ func TestClientGoneAfterCompletion(t *testing.T) {
 	e.f.Update(func(f *stratatest.Fake) { f.GenDelay, f.Content = 0, "" })
 }
 
-func TestColdEngineWakesAndRestores(t *testing.T) {
+// A cold engine with the file on disk: the arbiter loads the model at admission,
+// and the restore runs on the loaded engine. No request is spent waking it, and
+// the file stays.
+func TestColdEngineIsLoadedThenRestored(t *testing.T) {
 	e := setup(t, 50*time.Millisecond, 64<<20)
 	e.f.Set(20000, 0)
 	e.turn("A", 1)
 	eventually(t, "A's file", func() bool { return e.files() == 1 })
 
-	// the engine unloaded (--lazy, idle_unload_s): /metrics has no context or KV type,
-	// and the slot API answers 503 "not loaded"
+	// the engine unloaded (--lazy, idle_unload_s): /metrics has no context or KV type
 	e.f.Take()
 	e.f.Update(func(f *stratatest.Fake) { f.Unloaded, f.Loaded = true, false })
 	want(t, "a cold engine with the file on disk", e.turn("A", 2), actDisk)
-	if !strings.Contains(e.logs.String(), `"msg":"waking engine for restore"`) {
-		t.Error("the engine was not woken for the restore")
-	}
-	if acts := e.f.Take(); len(acts) != 4 || !strings.HasPrefix(acts[0], "restore ") ||
-		acts[1] != "gen /v1/chat/completions" || !strings.HasPrefix(acts[2], "restore ") ||
-		acts[3] != "gen /v1/chat/completions" {
-		t.Errorf("actions %q: want the refused restore, the wakeup, the restore again, the turn", acts)
+	if acts := e.f.Take(); len(acts) != 3 || acts[0] != "load" || !strings.HasPrefix(acts[1], "restore ") ||
+		acts[2] != "gen /v1/chat/completions" {
+		t.Errorf("actions %q: want the load, the restore, the turn", acts)
 	}
 	if e.files() != 1 {
-		t.Errorf("%d files: a restore on a woken engine evicted them", e.files())
+		t.Errorf("%d files: a restore on a loaded engine evicted them", e.files())
 	}
 	want(t, "the turn after the restore", e.turn("A", 3), actContinue)
 }
 
-func TestColdEngineNoFilePassesThrough(t *testing.T) {
+// The arbiter loads a cold engine on admission, so the cache never sees a route
+// that is resident with nothing loaded: the load is explicit, and the request is
+// forwarded after it.
+func TestColdEngineIsLoadedOnAdmission(t *testing.T) {
 	e := setup(t, 10*time.Millisecond, 64<<20)
 	e.f.Update(func(f *stratatest.Fake) { f.Unloaded, f.Loaded = true, false })
 	want(t, "a cold engine with no files", e.turn("A", 1), actMiss)
-	if !strings.Contains(e.logs.String(), `"reason":"engine_unloaded_cold"`) {
-		t.Error("a cold engine with nothing to restore was not recorded as engine_unloaded_cold")
-	}
-	if acts := e.f.Take(); len(acts) != 1 || acts[0] != "gen /v1/chat/completions" {
-		t.Errorf("actions %q: a cold engine with nothing to restore must not be woken", acts)
+	if acts := e.f.Take(); len(acts) != 2 || acts[0] != "load" || acts[1] != "gen /v1/chat/completions" {
+		t.Errorf("actions %q: the arbiter must load the cold engine, then forward", acts)
 	}
 }
 
@@ -552,47 +551,48 @@ func TestUnloadedEngineKeepsFiles(t *testing.T) {
 	}
 }
 
-func TestWokenEngineWithNewFingerprint(t *testing.T) {
+// A cold load into a different model: the fingerprint is read after the arbiter's
+// load, so the files of the model that is gone are evicted before any restore is
+// tried on them.
+func TestColdLoadIntoAnotherModelEvictsFiles(t *testing.T) {
 	e := setup(t, 50*time.Millisecond, 64<<20)
 	e.f.Set(20000, 0)
 	e.turn("A", 1)
 	eventually(t, "A's file", func() bool { return e.files() == 1 })
 
-	// woken into a different model: the fingerprint is checked before the restore is retried
 	e.f.Update(func(f *stratatest.Fake) { f.Unloaded, f.Loaded, f.Model = true, false, "another-model" })
-	want(t, "woken into another model", e.turn("A", 2), actMiss)
-	if !strings.Contains(e.logs.String(), `"msg":"woken into another engine; reading fresh"`) {
-		t.Error("the fingerprint check did not say what happened")
+	want(t, "loaded into another model", e.turn("A", 2), actMiss)
+	if !strings.Contains(e.logs.String(), `"reason":"fingerprint"`) {
+		t.Error("the files of the old model were not evicted for the fingerprint change")
 	}
 	if e.files() != 0 {
 		t.Errorf("%d files: a fingerprint change kept the files of the old engine", e.files())
 	}
 }
 
-func TestWakeupFailurePropagates(t *testing.T) {
+// A load the engine refuses: the admission does not make that its own 503. The
+// request goes to the engine, and the engine's answer is the client's answer.
+func TestRefusedLoadFailsOpen(t *testing.T) {
 	e := setup(t, 50*time.Millisecond, 64<<20)
 	e.f.Set(20000, 0)
 	e.turn("A", 1)
 	eventually(t, "A's file", func() bool { return e.files() == 1 })
 
-	// the engine refuses to wake: the failure the log and the metric see is the refused
-	// request, not the initial 503 "not loaded"
-	e.f.Update(func(f *stratatest.Fake) { f.Unloaded, f.Loaded, f.GenStatus = true, false, 502 })
+	e.f.Take() // the turn above is not part of this check
+	e.f.Update(func(f *stratatest.Fake) {
+		f.Unloaded, f.Loaded, f.LoadStatus, f.GenStatus = true, false, 502, 502
+	})
 	if status, _ := e.post(context.Background(), "/v1/chat/completions", conversation("A", 2)); status != 502 {
-		t.Fatalf("a turn that cannot wake the engine: status %d", status)
+		t.Fatalf("a turn whose engine cannot load: status %d", status)
 	}
-	want(t, "the restore that woke nothing", e.last(), actMiss)
-	if !strings.Contains(e.logs.String(), `"msg":"waking engine for restore"`) {
-		t.Error("the restore did not try to wake the engine")
+	if !strings.Contains(e.logs.String(), `"msg":"reload refused; the request goes to the engine"`) {
+		t.Error("the refused load was not recorded")
 	}
-	if !strings.Contains(e.logs.String(), `"reason":"http_502"`) {
-		t.Error("the failure was not attributed to the refused wakeup")
-	}
-	if strings.Contains(e.logs.String(), `"reason":"http_503"`) {
-		t.Error("the initial 503 was reported as the restore failure")
+	if acts := e.f.Take(); len(acts) < 2 || acts[0] != "load" {
+		t.Errorf("actions %q: the arbiter must try the load before forwarding", acts)
 	}
 	if e.files() != 1 {
-		t.Errorf("%d files: a failed wakeup evicted the file", e.files())
+		t.Errorf("%d files: a refused load evicted the file", e.files())
 	}
 }
 
@@ -782,4 +782,30 @@ func TestKeys(t *testing.T) {
 	if keys := key("/v1/responses", `{"input":"hello"}`); len(keys) != 1 {
 		t.Error("string input")
 	}
+}
+
+// A save's bytes-per-token is learned from a conversation worth saving. Strata's
+// live count can be 175K tokens while the file it writes is 226 MB of fixed
+// overhead, so a 3 MB/token estimate for the next reserve is a 175K conversation
+// asking for 534 GB, and the save is skipped: the session is lost at the switch.
+func TestSmallSaveDoesNotPoisonTheEstimate(t *testing.T) {
+	e := setup(t, time.Second, 1<<20)
+	e.f.Update(func(f *stratatest.Fake) { f.Tokens, f.SavedTokens, f.SaveBytes = 175000, 74, 226 << 20 })
+
+	if status, _ := e.post(context.Background(), "/v1/chat/completions", longBody(20000)); status != 200 {
+		t.Fatalf("the first long body: status %d", status)
+	}
+	eventually(t, "the first file", func() bool { return e.files() == 1 })
+
+	if status, _ := e.post(context.Background(), "/v1/chat/completions", longBody(200000)); status != 200 {
+		t.Fatalf("the next long body: status %d", status)
+	}
+	eventually(t, "the second file", func() bool { return e.files() == 2 })
+}
+
+// longBody is a conversation whose body is about words*5 bytes, so the proxy's
+// token estimate is words*5/4.
+func longBody(words int) string {
+	return `{"stream":true,"messages":[{"role":"system","content":"` + strings.Repeat("word ", words) +
+		`"},{"role":"user","content":"u"}]}`
 }

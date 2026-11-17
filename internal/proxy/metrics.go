@@ -14,7 +14,7 @@ type Metrics struct {
 	saves, restores, savedBytes, restoredBytes, panics            prometheus.Counter
 	saveSeconds, restoreSeconds                                   prometheus.Histogram
 	lastSave, lastRestore                                         prometheus.Gauge
-	swaps, prefillTokens                                          prometheus.Counter
+	swaps, prefillTokens, reloads                                 prometheus.Counter
 	swapSeconds                                                   prometheus.Histogram
 	swapBlocked                                                   *prometheus.CounterVec
 	queue                                                         prometheus.Gauge
@@ -49,6 +49,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		restoredBytes:  counter("restored_bytes_total", "Bytes read from session files."),
 		panics:         counter("panics_total", "Panics in the cache logic (the request went through)."),
 		swaps:          counter("swaps_total", "Times the card was given to another route."),
+		reloads:        counter("reloads_total", "Times the resident route's model was loaded from cold."),
 		prefillTokens:  counter("re_prefill_tokens_total", "Tokens of requests that ran with no session to restore, an estimate of what a swap cost in re-prefill."),
 		saveSeconds:    hist("save_seconds", "Time to save a session file."),
 		restoreSeconds: hist("restore_seconds", "Time to restore a session file."),
@@ -61,8 +62,8 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		resident:    prometheus.NewGaugeVec(prometheus.GaugeOpts(opts("resident_route", "1 for the route holding the card.")), []string{"route"}),
 	}
 	reg.MustRegister(m.requests, m.savesBy, m.skipped, m.failures, m.evictions, m.evictedBytes, m.saves, m.restores,
-		m.savedBytes, m.restoredBytes, m.panics, m.swaps, m.prefillTokens, m.saveSeconds, m.restoreSeconds, m.swapSeconds,
-		m.swapBlocked, m.queue, m.resident, m.lastSave, m.lastRestore)
+		m.savedBytes, m.restoredBytes, m.panics, m.swaps, m.reloads, m.prefillTokens, m.saveSeconds, m.restoreSeconds,
+		m.swapSeconds, m.swapBlocked, m.queue, m.resident, m.lastSave, m.lastRestore)
 	return m
 }
 
@@ -118,6 +119,11 @@ func (m *Metrics) Swap(from, to string, seconds float64) {
 // SwapBlocked is the arbiter's Observers.SwapBlocked.
 func (m *Metrics) SwapBlocked(reason string) {
 	m.swapBlocked.WithLabelValues(reason).Inc()
+}
+
+// Reloaded is the arbiter's Observers.Reloaded.
+func (m *Metrics) Reloaded(route string) {
+	m.reloads.Inc()
 }
 
 // Queue is the arbiter's Observers.Queue.

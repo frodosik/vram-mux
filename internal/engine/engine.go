@@ -126,4 +126,7 @@ type Options struct {
 	APIKey string
 	// Timeout bounds one slot call; a 200K-token session file is several GB.
 	Timeout time.Duration
+	// LoadTimeout bounds Load, which waits for the model to become resident.
+	// 0: the slot timeout.
+	LoadTimeout time.Duration
 }

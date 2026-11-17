@@ -50,11 +50,50 @@ func New(opt Options) *Proxy {
 	p := &Proxy{arb: opt.Arbiter, maxBody: opt.MaxBody, log: opt.Log, proxies: map[string]*httputil.ReverseProxy{}}
 	if opt.Arbiter != nil {
 		p.cache = newCache(opt.Arbiter, opt.Store, opt.Metrics, opt.Log, opt.Policy)
+		// A swap ends both engines' live conversations: the arbiter says so, and the
+		// cache must stop calling a request a continuation of a conversation the
+		// engine no longer holds.
+		opt.Arbiter.SetObservers(observers{m: opt.Metrics, c: p.cache})
 		for _, r := range opt.Arbiter.Routes() {
 			p.proxies[r.ID] = reverseProxy(r, opt.Log)
 		}
 	}
 	return p
+}
+
+// observers is the arbiter's observer: the metrics, plus the cache's note that
+// a swap cleared both routes' live conversation, and that a cold load cleared the
+// conversation the loaded engine used to hold.
+type observers struct {
+	m *Metrics
+	c *cache
+}
+
+func (o observers) Swap(from, to string, seconds float64) {
+	if o.m != nil {
+		o.m.Swap(from, to, seconds)
+	}
+	if o.c != nil {
+		o.c.Swap(from, to, seconds)
+	}
+}
+
+func (o observers) SwapBlocked(reason string) {
+	if o.m != nil {
+		o.m.SwapBlocked(reason)
+	}
+}
+
+func (o observers) Queue(n int, resident string) {
+	if o.m != nil {
+		o.m.Queue(n, resident)
+	}
+}
+
+func (o observers) Reloaded(route string) {
+	if o.c != nil {
+		o.c.Reloaded(route)
+	}
 }
 
 // reverseProxy forwards to one route's server. The client's Host and Origin are

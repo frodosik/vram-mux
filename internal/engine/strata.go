@@ -120,7 +120,7 @@ func (s *Strata) slot(ctx context.Context, action, name string) (int, int64, err
 // Load makes the model resident. A 503 carrying a Retry-After is the GPU being
 // busy: the model does not fit now, so Load reports that.
 func (s *Strata) Load(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, s.cl.timeout)
+	ctx, cancel := context.WithTimeout(ctx, s.cl.loadWindow())
 	defer cancel()
 	r, err := s.cl.do(ctx, http.MethodPost, "/v1/load", emptyBody)
 	if err != nil {
@@ -215,7 +215,7 @@ var emptyBody = []byte(`{}`)
 // one bearer token.
 type client struct {
 	id, model, base, apiKey string
-	timeout                 time.Duration
+	timeout, loadTimeout    time.Duration
 	http                    http.Client
 }
 
@@ -225,7 +225,17 @@ func newClient(o Options) client {
 	if o.Timeout <= 0 {
 		o.Timeout = 15 * time.Minute
 	}
-	return client{id: o.ID, model: o.Model, base: strings.TrimRight(o.Base, "/"), apiKey: o.APIKey, timeout: o.Timeout}
+	return client{id: o.ID, model: o.Model, base: strings.TrimRight(o.Base, "/"), apiKey: o.APIKey,
+		timeout: o.Timeout, loadTimeout: o.LoadTimeout}
+}
+
+// loadWindow is how long a load may take: the load timeout when one was set,
+// else the slot timeout.
+func (c *client) loadWindow() time.Duration {
+	if c.loadTimeout > 0 && c.loadTimeout < c.timeout {
+		return c.loadTimeout
+	}
+	return c.timeout
 }
 
 // resp is one answer from a server.
@@ -325,11 +335,18 @@ func (c *client) postJSON(ctx context.Context, path string, body []byte) (*resp,
 }
 
 // slot POSTs one /slots/0 call with {"filename":name} and returns its answer.
+// slot sends one slot action with the file name in the body.
 func (c *client) slot(ctx context.Context, path, name string) ([]byte, error) {
+	return c.slotBody(ctx, path, map[string]string{"filename": name})
+}
+
+// slotBody POSTs one slot action with the body the server asks for and returns
+// its answer. A slot for a model that is not resident is a refusal, not a 200.
+func (c *client) slotBody(ctx context.Context, path string, body map[string]string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
-	body, _ := json.Marshal(map[string]string{"filename": name})
-	r, err := c.do(ctx, http.MethodPost, path, body)
+	raw, _ := json.Marshal(body)
+	r, err := c.do(ctx, http.MethodPost, path, raw)
 	if err != nil {
 		return nil, err
 	}

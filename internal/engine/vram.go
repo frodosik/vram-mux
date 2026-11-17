@@ -2,6 +2,7 @@ package engine
 
 import (
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,6 +14,30 @@ import (
 
 // SysfsVRAM is the amdgpu device node for the card the engines share.
 var SysfsVRAM = "/sys/class/drm/card0/device"
+
+// SysfsRoot is where the DRM cards live; settable for tests.
+var SysfsRoot = "/sys/class/drm"
+
+// DetectCard names the device node of the card with the most VRAM: on a box with
+// an integrated GPU the discrete card is card1, so a fixed card0 path reads
+// nothing and the gate goes blind. "" when no card answers.
+func DetectCard() string {
+	best, bestTotal := "", int64(-1)
+	dirs, err := filepath.Glob(SysfsRoot + "/card*/device")
+	if err != nil {
+		return ""
+	}
+	for _, dir := range dirs {
+		total, err := readSysfs(dir + "/mem_info_vram_total")
+		if err != nil {
+			continue
+		}
+		if total > bestTotal {
+			best, bestTotal = dir, total
+		}
+	}
+	return best
+}
 
 // FreeVRAM returns bytes free on the card: total - used. It is the figure the
 // arbiter's margin gate is measured against.
