@@ -138,9 +138,20 @@ func (m *Metrics) Request(action string) {
 	m.requests.WithLabelValues(action).Inc()
 }
 
-// Registry is the registry the metrics were registered with, for a test that
-// gathers them. nil when NewMetrics got a Registerer that is not a registry.
-func (m *Metrics) Registry() *prometheus.Registry { return m.reg }
+// SeedResident marks the route that owns the card at startup. The arbiter is told
+// which route holds the card before any request (a --lazy Strata server owns it),
+// and SetRoutes alone would read 0 for it: the first scrape says who owns the card.
+func (m *Metrics) SeedResident(route string) {
+	if route == "" {
+		return
+	}
+	m.setResidentInfo(route, true)
+	m.resident.WithLabelValues(route).Set(1)
+}
+
+// registry is the registry the metrics were registered with, for tests that gather
+// them. Unexported: it exists for the suite, not for a caller.
+func (m *Metrics) registry() *prometheus.Registry { return m.reg }
 
 // setResidentInfo writes resident_info for one route. A route the metrics have no
 // model for is skipped: the label has to name the model, not guess it.

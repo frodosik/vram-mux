@@ -62,8 +62,10 @@ func New(opt Options) *Proxy {
 			routes[r.ID] = r.Model
 		}
 		if opt.Metrics != nil {
-			// resident_info needs the route→model table before the first request.
+			// resident_info needs the route→model table before the first request,
+			// and the route the arbiter says owns the card at startup gets its 1.
 			opt.Metrics.SetRoutes(routes)
+			opt.Metrics.SeedResident(opt.Arbiter.Resident())
 		}
 	}
 	return p
