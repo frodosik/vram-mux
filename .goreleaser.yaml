@@ -1,7 +1,11 @@
 version: 2
 
+project_name: gpu-arbiter
+
 builds:
-  - main: ./cmd/strata-diskcache
+  - id: gpu-arbiter
+    binary_name: gpu-arbiter
+    main: ./cmd/gpu-arbiter
     env: [CGO_ENABLED=0]
     goos: [linux]
     goarch: [amd64, arm64]

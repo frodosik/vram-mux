@@ -5,7 +5,7 @@ GOLANGCI_LINT ?= go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v
 .PHONY: build test lint fmt clean
 
 build:
-	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o strata-diskcache ./cmd/strata-diskcache
+	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o gpu-arbiter ./cmd/gpu-arbiter
 
 test:
 	@test -z "$$(gofmt -l .)" || { gofmt -l .; echo "run: make fmt"; exit 1; }
@@ -19,4 +19,4 @@ fmt:
 	gofmt -w .
 
 clean:
-	rm -rf strata-diskcache dist
+	rm -rf gpu-arbiter dist

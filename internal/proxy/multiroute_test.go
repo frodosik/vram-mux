@@ -19,10 +19,10 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/tfyl/strata-diskcache/internal/arbiter"
-	"github.com/tfyl/strata-diskcache/internal/engine"
-	"github.com/tfyl/strata-diskcache/internal/store"
-	"github.com/tfyl/strata-diskcache/internal/strata/stratatest"
+	"github.com/frodosik/gpu-arbiter/internal/arbiter"
+	"github.com/frodosik/gpu-arbiter/internal/engine"
+	"github.com/frodosik/gpu-arbiter/internal/store"
+	"github.com/frodosik/gpu-arbiter/internal/strata/stratatest"
 )
 
 // llamaFake is a llama.cpp b12445 router with two presets: it loads a model only
@@ -567,7 +567,7 @@ func TestStrictRefusesAnUnknownModel(t *testing.T) {
 	}
 	// The refusal is counted, not only logged: a scrape shows what the arbiter
 	// turned away, which is how an operator finds a model-name mixup.
-	if v := counterValue(t, p.m.registry(), "strata_diskcache_requests_total", "action", "refused"); v != 1 {
+	if v := counterValue(t, p.m.registry(), "gpu_arbiter_requests_total", "action", "refused"); v != 1 {
 		t.Errorf("requests_total{action=\"refused\"} = %v, want 1", v)
 	}
 }
@@ -708,7 +708,7 @@ func TestResidentInfoNamesTheModelFromTheStart(t *testing.T) {
 	p, _, _, _, url, _, _ := twoRouteEnvWith(t, envOpts{strict: true, idle: 10 * time.Millisecond})
 	reg := p.m.registry()
 	want := map[string]float64{"model=flash route=strata/flash": 0, "model=swift route=llama/swift": 0}
-	got := gaugeSeries(t, reg, "strata_diskcache_resident_info")
+	got := gaugeSeries(t, reg, "gpu_arbiter_resident_info")
 	if len(got) != len(want) {
 		t.Fatalf("series %v, want both routes named before any request", got)
 	}
@@ -720,7 +720,7 @@ func TestResidentInfoNamesTheModelFromTheStart(t *testing.T) {
 	if n := postModel(t, url, "flash", withModel("flash", conversation("A", 2))); n == 0 {
 		t.Fatal("flash turn failed")
 	}
-	got = gaugeSeries(t, reg, "strata_diskcache_resident_info")
+	got = gaugeSeries(t, reg, "gpu_arbiter_resident_info")
 	if got["model=flash route=strata/flash"] != 1 {
 		t.Errorf("the resident gauge is %v, want 1 for the route holding the card", got["model=flash route=strata/flash"])
 	}
@@ -842,7 +842,7 @@ func TestQueueWiringMakesTheIdleSaveStepOut(t *testing.T) {
 // owning the card, which is the mixup this gauge exists to make visible.
 func TestResidentInfoSeedsTheInitialResident(t *testing.T) {
 	p, _, _, _, _, _, _ := twoRouteEnvWith(t, envOpts{strict: true, idle: 10 * time.Millisecond, initialResident: "strata/flash"})
-	got := gaugeSeries(t, p.m.registry(), "strata_diskcache_resident_info")
+	got := gaugeSeries(t, p.m.registry(), "gpu_arbiter_resident_info")
 	if got["model=flash route=strata/flash"] != 1 {
 		t.Errorf("the initial resident's gauge is %v, want 1 before any request", got["model=flash route=strata/flash"])
 	}
@@ -931,7 +931,7 @@ func TestStrictNonGenPOSTToOtherModelIsRefused(t *testing.T) {
 	if !strings.Contains(logs.String(), `"model":"swift"`) {
 		t.Error("the log does not name the refused model")
 	}
-	if v := counterValue(t, p.m.registry(), "strata_diskcache_requests_total", "action", "refused"); v != 2 {
+	if v := counterValue(t, p.m.registry(), "gpu_arbiter_requests_total", "action", "refused"); v != 2 {
 		t.Errorf(`requests_total{action="refused"} = %v, want 2`, v)
 	}
 }
@@ -1007,7 +1007,7 @@ func TestBusyCardIsRecordedLikeARefusal(t *testing.T) {
 	if !strings.Contains(rec, `"model":"swift"`) || !strings.Contains(rec, `"diskcache":"denied"`) {
 		t.Errorf("/requests %q, want the denied model and the denial recorded", rec)
 	}
-	if v := counterValue(t, p.m.registry(), "strata_diskcache_requests_total", "action", "denied"); v != 1 {
+	if v := counterValue(t, p.m.registry(), "gpu_arbiter_requests_total", "action", "denied"); v != 1 {
 		t.Errorf(`requests_total{action="denied"} = %v, want 1`, v)
 	}
 }
@@ -1061,7 +1061,7 @@ func TestClientGoneWhileWaitingIsNotADenial(t *testing.T) {
 	if rec := p.requestsJSON(); strings.Contains(rec, `"model":"swift"`) {
 		t.Errorf("/requests %q, want no record for a request whose client walked away", rec)
 	}
-	if v := counterValue(t, p.m.registry(), "strata_diskcache_requests_total", "action", "denied"); v != -1 {
+	if v := counterValue(t, p.m.registry(), "gpu_arbiter_requests_total", "action", "denied"); v != -1 {
 		t.Errorf(`requests_total{action="denied"} = %v, want no denial counted`, v)
 	}
 	if llama.Take() != nil {

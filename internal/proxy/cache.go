@@ -7,10 +7,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tfyl/strata-diskcache/internal/arbiter"
-	"github.com/tfyl/strata-diskcache/internal/engine"
-	"github.com/tfyl/strata-diskcache/internal/store"
-	"github.com/tfyl/strata-diskcache/internal/strata"
+	"github.com/frodosik/gpu-arbiter/internal/arbiter"
+	"github.com/frodosik/gpu-arbiter/internal/engine"
+	"github.com/frodosik/gpu-arbiter/internal/store"
+	"github.com/frodosik/gpu-arbiter/internal/strata"
 )
 
 // Policy tunes when the cache saves.

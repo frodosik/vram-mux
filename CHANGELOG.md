@@ -2,7 +2,34 @@
 
 ## Unreleased
 
+### Added
+
+- **The project is `gpu-arbiter`** (module `github.com/frodosik/gpu-arbiter`): one GPU shared by
+  several engine processes, with the arbiter owning model loads, the drain queue, and the free-VRAM
+  gate. The metrics namespace is `gpu_arbiter_*`.
+- A **nvidia-smi fallback** for the free-VRAM gate: the amdgpu sysfs node is preferred, a box with
+  no amdgpu card gets `nvidia-smi --query-gpu=index,memory.free,memory.total` with a 2 s timeout;
+  `--gpu-index` pins a card, `-1` (default) picks the card with the most VRAM.
+- `--strata-model` is **required when a Strata route is used**; the Strata route is built only when
+  the model is named, so a box with `--route` flags only needs no Strata. A config with no model and
+  no route is refused.
+- **Turn-boundary files below `--min-tokens`**: the first turn of a conversation (1–2 chain keys) is
+  admitted at `--min-tokens/4`, so a fresh spawn can be restored from disk. A small file never
+  teaches the route's bytes-per-token.
+- **A prefix-restore index**: a chain key from an earlier turn resolves only to a file saved when
+  that key was terminal, bounded by the prompt estimate, so a fork behind a grown parent restores
+  the parent's boundary file, never the grown file.
+
 ### Changed
+
+- `Covered` ("already on disk") consults **only the last chain key** of the request, never ancestor
+  keys: a new conversation that shares a system prompt with an older one is no longer treated as
+  cached, and its turn-boundary file is written.
+- A save's size is read from **the engine's own count** (`cache + prompt + predicted` for the
+  conversation it just served), not the count the route stored for the conversation served before:
+  a stale big count used to skip a small conversation's boundary save, and a stale count admitted
+  tiny conversations as multi-hundred-MB prefix files.
+
 
 - The arbiter owns model loads: admission loads the resident route's model when the engine reports
   unloaded, and a load that succeeds drops that route's live-conversation beliefs. The cache no
@@ -42,7 +69,7 @@
   whose client walked away while it waited for the card is not counted: no record, no counter, no 503 body.
 
 - **Flags take two dashes** (`--session-dir`, not `-session-dir`). The environment variables are unchanged.
-- `go install` path is now `github.com/tfyl/strata-diskcache/cmd/strata-diskcache@latest`.
+- `go install` path is now `github.com/tfyl/gpu-arbiter/cmd/gpu-arbiter@latest`.
 - Session files are named `dc-<fingerprint>-<key>-<tokens>.session`. Files in the first version's format are
   deleted at start.
 - `strata_diskcache_save_seconds` and `strata_diskcache_restore_seconds` are histograms now (`_sum` as before, plus

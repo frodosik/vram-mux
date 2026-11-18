@@ -1,0 +1,43 @@
+# One RDNA3 card, two routes (Strata + llama.cpp). Run as the user the engines
+# run as, so the proxy can delete the session files the engines write.
+# The engines are separate units; the arbiter is started after them.
+
+[Unit]
+Description=gpu-arbiter (one GPU, several engine processes, disk conversation cache)
+After=network-online.target strata.service llama-server.service
+Wants=strata.service llama-server.service
+
+[Service]
+Type=simple
+User=model
+Group=model
+Environment=LISTEN=:8080
+Environment=METRICS_LISTEN=127.0.0.1:8082
+Environment=SESSION_DIR=/var/lib/gpu-arbiter/sessions
+Environment=UPSTREAM=http://127.0.0.1:8095
+Environment=STRATA_MODEL=qwen3.8-flash-next-iq2_xs
+Environment=STRATA_API_KEY=file:/etc/gpu-arbiter/api.keys
+Environment=ROUTES=llama|llama/27b|qwen3.8-27b|http://127.0.0.1:8001||18000
+Environment=MAX_GIB=80
+Environment=MIN_TOKENS=4096
+Environment=REGROW_TOKENS=4096
+Environment=MIN_FREE_MIB=512
+Environment=SNAPSHOT_BYTES_PER_TOKEN=8192
+Environment=IDLE_SAVE_S=2
+Environment=MAX_IDLE_SAVE_TOKENS=32768
+Environment=STRATA_NEED_MIB=3072
+Environment=BODY_DIVISOR=4
+Environment=MAX_RESIDENT_STREAK=32
+Environment=VRAM_MARGIN_MIB=1024
+Environment=DRAIN_WAIT_S=300
+Environment=LOAD_TIMEOUT_S=600
+Environment=VRAM_POLL_S=2
+Environment=LOG_OUTPUT=stderr
+Environment=LOG_FORMAT=json
+Environment=LOG_LEVEL=info
+ExecStart=/usr/local/bin/gpu-arbiter
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,39 @@
+# NVIDIA, llama.cpp routes only. Run as the user the engines run as. The VRAM
+# gate uses the nvidia-smi backend: install nvidia-smi and keep it readable for
+# this user. --gpu-index pins a card; -1 picks the one with most VRAM.
+
+[Unit]
+Description=gpu-arbiter (NVIDIA, llama.cpp routes, disk conversation cache)
+After=network-online.target llama-server.service llama-server2.service
+Wants=llama-server.service llama-server2.service
+
+[Service]
+Type=simple
+User=model
+Group=model
+Environment=LISTEN=:8080
+Environment=METRICS_LISTEN=127.0.0.1:8082
+Environment=SESSION_DIR=/var/lib/gpu-arbiter/sessions
+Environment=ROUTES=llama|llama/27b|qwen3.8-27b|http://127.0.0.1:8001||18000 llama|llama/orcacyber|orcacyber-security-reviewer|http://127.0.0.1:8002||9000
+Environment=MAX_GIB=40
+Environment=MIN_TOKENS=15000
+Environment=REGROW_TOKENS=4096
+Environment=MIN_FREE_MIB=4096
+Environment=IDLE_SAVE_S=3
+Environment=MAX_IDLE_SAVE_TOKENS=32768
+Environment=BODY_DIVISOR=4
+Environment=MAX_RESIDENT_STREAK=32
+Environment=VRAM_MARGIN_MIB=1024
+Environment=GPU_INDEX=-1
+Environment=VRAM_POLL_S=2
+Environment=DRAIN_WAIT_S=300
+Environment=LOAD_TIMEOUT_S=600
+Environment=LOG_OUTPUT=stderr
+Environment=LOG_FORMAT=json
+Environment=LOG_LEVEL=info
+ExecStart=/usr/local/bin/gpu-arbiter
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

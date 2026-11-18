@@ -1,4 +1,4 @@
-module github.com/tfyl/strata-diskcache
+module github.com/frodosik/gpu-arbiter
 
 go 1.26.0
 

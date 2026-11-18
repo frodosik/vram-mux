@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tfyl/strata-diskcache/internal/engine"
+	"github.com/frodosik/gpu-arbiter/internal/engine"
 )
 
 // card is the shared GPU: both routes need the same bytes.

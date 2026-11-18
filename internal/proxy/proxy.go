@@ -20,8 +20,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tfyl/strata-diskcache/internal/arbiter"
-	"github.com/tfyl/strata-diskcache/internal/store"
+	"github.com/frodosik/gpu-arbiter/internal/arbiter"
+	"github.com/frodosik/gpu-arbiter/internal/store"
 )
 
 // Options configure the proxy.

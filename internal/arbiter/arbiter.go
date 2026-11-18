@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tfyl/strata-diskcache/internal/engine"
+	"github.com/frodosik/gpu-arbiter/internal/engine"
 )
 
 // Route is one resident identity: a backend and the model it is running.

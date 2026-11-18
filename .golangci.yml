@@ -33,4 +33,4 @@ formatters:
   enable: [gofmt, goimports]
   settings:
     goimports:
-      local-prefixes: [github.com/tfyl/strata-diskcache]
+      local-prefixes: [github.com/frodosik/gpu-arbiter]

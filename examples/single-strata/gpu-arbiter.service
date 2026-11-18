@@ -1,0 +1,37 @@
+# Single Strata engine with the disk cache. Run as the user Strata runs as, so
+# the proxy can delete the session files Strata writes. Start after Strata.
+
+[Unit]
+Description=gpu-arbiter (single Strata engine, disk conversation cache)
+After=network-online.target strata.service
+Wants=strata.service
+
+[Service]
+Type=simple
+User=model
+Group=model
+Environment=LISTEN=:8080
+Environment=METRICS_LISTEN=127.0.0.1:8082
+Environment=UPSTREAM=http://127.0.0.1:8095
+Environment=STRATA_MODEL=qwen3.8-flash-next-iq2_xs
+Environment=STRATA_API_KEY=file:/etc/gpu-arbiter/api.keys
+Environment=SESSION_DIR=/var/lib/gpu-arbiter/sessions
+Environment=MAX_GIB=40
+Environment=RETENTION_DAYS=7
+Environment=MIN_FREE_MIB=4096
+Environment=MIN_TOKENS=15000
+Environment=REGROW_TOKENS=4096
+Environment=IDLE_SAVE_S=3
+Environment=MAX_IDLE_SAVE_TOKENS=32768
+Environment=SNAPSHOT_BYTES_PER_TOKEN=65536
+Environment=MAX_BODY_MIB=64
+Environment=SHUTDOWN_S=20
+Environment=LOG_OUTPUT=stderr
+Environment=LOG_FORMAT=json
+Environment=LOG_LEVEL=info
+ExecStart=/usr/local/bin/gpu-arbiter
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

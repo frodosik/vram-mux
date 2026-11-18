@@ -55,7 +55,7 @@ func (k *keyer) keys(path string, raw []byte) ([]string, bool) {
 	}
 
 	h := sha256.New()
-	h.Write([]byte("strata-diskcache v1\x00" + path))
+	h.Write([]byte("strata-diskcache v1\x00" + path)) // the salt is fixed: a change invalidates every saved file's key
 	for i, f := range []json.RawMessage{b.System, b.Instructions, b.Tools, b.ReasoningEffort, b.Thinking, b.ESP, b.TemplateKwargs} {
 		if isSet(f) {
 			c := k.canon(f)
