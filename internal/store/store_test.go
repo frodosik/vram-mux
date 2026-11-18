@@ -274,8 +274,10 @@ func TestCommitLookupAndCorruptFiles(t *testing.T) {
 	if _, ok := s.Lookup("222222222222", fp, t3, 40000); ok {
 		t.Error("found in another route's namespace")
 	}
-	if !s.Covered(ns, fp, t2, 20000) || s.Covered(ns, fp, t2, 20001) {
-		t.Error("Covered is wrong")
+	// Covered looks only at the conversation's own last key: t2's key(2) has no
+	// file, so no count covers it, and turn 1's file covers exactly its own count.
+	if s.Covered(ns, fp, t2, 1) || !s.Covered(ns, fp, t1, 20000) || s.Covered(ns, fp, t1, 20001) {
+		t.Error("Covered must look only at the conversation's own last key")
 	}
 
 	// The engine counted 30123 tokens where 30000 were planned: renamed, and turn 1's
@@ -290,13 +292,17 @@ func TestCommitLookupAndCorruptFiles(t *testing.T) {
 	if e, ok := s.Lookup(ns, fp, t2, 25000); !ok || e.Key != key(3) || e.Tokens != 30123 {
 		t.Errorf("the conversation's own last key: %+v %v, want turn 2's file", e, ok)
 	}
-	// Prefix aliases are filtered by the prompt: key(2) points at the turn 2 file
-	// of 30123 tokens, restored only by a prompt that can hold it.
-	if _, ok := s.Lookup(ns, fp, []string{key(2), key(9)}, 25000); ok {
-		t.Error("a prefix alias of a longer file was restored")
+	// A chain key that was never terminal names no file: key(2) resolves to
+	// nothing at any prompt, and the descent reaches turn 1's boundary, whose
+	// file is restored only by a prompt that can hold its 20000 tokens.
+	if _, ok := s.Lookup(ns, fp, []string{key(2), key(9)}, 31000); ok {
+		t.Error("a key that was never terminal resolved to a longer file")
 	}
-	if e, ok := s.Lookup(ns, fp, []string{key(2), key(9)}, 31000); !ok || e.Key != key(3) || e.Tokens != 30123 {
-		t.Errorf("a prefix alias at a long-enough prompt: %+v %v, want turn 2's file", e, ok)
+	if e, ok := s.Lookup(ns, fp, []string{key(1), key(2), key(9)}, 25000); !ok || e.Key != key(1) || e.Tokens != 20000 {
+		t.Errorf("the descent to turn 1's boundary: %+v %v, want turn 1's file", e, ok)
+	}
+	if _, ok := s.Lookup(ns, fp, []string{key(1), key(2), key(9)}, 15000); ok {
+		t.Error("a prompt shorter than the boundary file restored it")
 	}
 	if _, err := s.Commit(ns, fp, t3, 1, 1); err == nil {
 		t.Error("committed a file the engine did not write")
@@ -343,13 +349,17 @@ func TestPrefixIndexSurvivesCommitsAndRestart(t *testing.T) {
 	if e, ok := s.Lookup(ns, fp, t4, 35000); !ok || e.Key != key(5) || e.Tokens != 40000 {
 		t.Errorf("fork lookup: %+v %v, want turn 3's file", e, ok)
 	}
-	// A prefix alias of turn 2's file is restored by a prompt that can hold its
-	// 30000 tokens, and skipped by a shorter one
-	if e, ok := s.Lookup(ns, fp, []string{key(2), key(6)}, 35000); !ok || e.Key != key(3) || e.Tokens != 30000 {
-		t.Errorf("fork alias lookup: %+v %v, want turn 2's file", e, ok)
+	// key(2) was never a terminal key, so it names no file at any prompt. key(3),
+	// the turn-boundary file of 30000 tokens, is restored by a prompt that can
+	// hold it and skipped by a shorter one.
+	if _, ok := s.Lookup(ns, fp, []string{key(2), key(6)}, 35000); ok {
+		t.Error("a key that was never terminal resolved to a deeper file")
 	}
-	if _, ok := s.Lookup(ns, fp, []string{key(2), key(6)}, 25000); ok {
-		t.Error("a prompt shorter than the alias file restored it")
+	if e, ok := s.Lookup(ns, fp, []string{key(3), key(6)}, 35000); !ok || e.Key != key(3) || e.Tokens != 30000 {
+		t.Errorf("fork boundary lookup: %+v %v, want turn 2's file", e, ok)
+	}
+	if _, ok := s.Lookup(ns, fp, []string{key(3), key(6)}, 25000); ok {
+		t.Error("a prompt shorter than the boundary file restored it")
 	}
 
 	// Restart: a fresh store on the same folder rebuilds the prefix index from
@@ -359,8 +369,88 @@ func TestPrefixIndexSurvivesCommitsAndRestart(t *testing.T) {
 	if err := s2.Load(); err != nil {
 		t.Fatal(err)
 	}
-	if e, ok := s2.Lookup(ns, fp, []string{key(2), key(6)}, 35000); !ok || e.Key != key(3) || e.Tokens != 30000 {
+	if e, ok := s2.Lookup(ns, fp, []string{key(3), key(6)}, 35000); !ok || e.Key != key(3) || e.Tokens != 30000 {
 		t.Errorf("after a restart: %+v %v, want turn 2's file", e, ok)
+	}
+	if _, ok := s2.Lookup(ns, fp, []string{key(2), key(6)}, 35000); ok {
+		t.Error("the restart rebuilt an alias for a key that was never terminal")
+	}
+}
+
+// The measured session-save bug: a new conversation shares the opening chain keys
+// of an older, much deeper one — the same system prompt and the same first
+// messages, a 3,309-token root inside an 116k conversation — and every shared key
+// resolves to the deep session's file. Covered must consult only the
+// conversation's own last key, so the 20k and 43k conversations are never marked
+// on_disk and their saves run.
+func TestNewSessionSharingRootKeyIsNotCovered(t *testing.T) {
+	s, dir, _ := newStore(t, 1<<30, 1<<40)
+	deep := []string{key(1), key(2), key(3), key(4)}
+	write(t, dir, name(4, 116000), 60, time.Now())
+	if _, err := s.Commit(ns, fp, deep, 116000, 116000); err != nil {
+		t.Fatal(err)
+	}
+	// The new session: its launch boundary at 20,802 tokens, then 43,278, both
+	// sharing key(1) and key(2) with the deep session.
+	launch := []string{key(1), key(2), key(9)}
+	grown := []string{key(1), key(2), key(9), key(10)}
+	if s.Covered(ns, fp, launch, 20802-4096) || s.Covered(ns, fp, grown, 43278-4096) {
+		t.Error("sharing an ancestor key with a deep session marked the new conversation on_disk")
+	}
+	// Its own saves run, each keyed by its own last key
+	write(t, dir, name(9, 20802), 12, time.Now())
+	if _, err := s.Commit(ns, fp, launch, 20802, 20802); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(dir, name(9, 20802)) || !s.Covered(ns, fp, launch, 20802-4096) {
+		t.Error("the 20k conversation's own boundary is not on disk and covering it")
+	}
+	write(t, dir, name(10, 43278), 24, time.Now())
+	if _, err := s.Commit(ns, fp, grown, 43278, 43278); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(dir, name(10, 43278)) || !s.Covered(ns, fp, grown, 43278-4096) {
+		t.Error("the 43k conversation's own boundary is not on disk and covering it")
+	}
+	// The deep session's file is still its own, and a chain reaching key(4) finds it
+	if e, ok := s.Lookup(ns, fp, []string{key(1), key(2), key(3), key(4), key(11)}, 120000); !ok || e.Tokens != 116000 {
+		t.Errorf("the deep conversation's own boundary: %+v %v, want its 116000-token file", e, ok)
+	}
+}
+
+// The prefix index never aliases forward. A lookup for a chain that shares
+// key(1) with a deep session finds only files whose own saved count is at or
+// below the prompt, and a restart rebuilds the same rule.
+func TestPrefixIndexNeverAliasesLongerDescendant(t *testing.T) {
+	s, dir, _ := newStore(t, 1<<30, 1<<40)
+	deep := []string{key(1), key(2), key(3), key(4)}
+	write(t, dir, name(4, 116000), 60, time.Now())
+	if _, err := s.Commit(ns, fp, deep, 116000, 116000); err != nil {
+		t.Fatal(err)
+	}
+	// The new session's 20k prompt shares key(1): the deep file is not restored
+	if _, ok := s.Lookup(ns, fp, []string{key(1), key(7)}, 20000); ok {
+		t.Error("a 20k prompt restored the 116k file through a shared key")
+	}
+	// The session's own boundary is what its fork finds
+	write(t, dir, name(7, 19000), 12, time.Now())
+	if _, err := s.Commit(ns, fp, []string{key(1), key(7)}, 19000, 19000); err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := s.Lookup(ns, fp, []string{key(1), key(7), key(8)}, 20000); !ok || e.Name() != name(7, 19000) {
+		t.Errorf("the fork of the 20k session: %+v %v, want its own 19000-token file", e, ok)
+	}
+	// A restart rebuilds the prefix index with the same rule
+	s2 := New(Options{Dir: dir, MaxBytes: 1 << 30, MaxAge: 7 * 24 * time.Hour, MinFree: 100,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), FreeSpace: func(string) (int64, error) { return 1 << 40, nil }})
+	if err := s2.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s2.Lookup(ns, fp, []string{key(1), key(9)}, 20000); ok {
+		t.Error("the restart aliased key(1) forward to a longer file")
+	}
+	if e, ok := s2.Lookup(ns, fp, []string{key(1), key(7), key(8)}, 20000); !ok || e.Name() != name(7, 19000) {
+		t.Errorf("after a restart: %+v %v, want the session's own file", e, ok)
 	}
 }
 
@@ -404,7 +494,12 @@ func TestChainTornLinesCleanAtLoad(t *testing.T) {
 	if strings.Contains(string(raw), `"`+key(4)+`"`) {
 		t.Errorf("the torn line survived Load: %s", raw)
 	}
-	if e, ok := s2.Lookup(ns, fp, []string{key(1), key(5)}, 20000); !ok || e.Tokens != 20000 || e.Name() != name(2, 20000) {
+	// key(1) was never terminal, so the rebuild gives it no file, and a chain
+	// reaching key(2), the terminal key of the clean line, finds that file.
+	if _, ok := s2.Lookup(ns, fp, []string{key(1), key(5)}, 20000); ok {
+		t.Error("the rebuild aliased a key that was never terminal")
+	}
+	if e, ok := s2.Lookup(ns, fp, []string{key(1), key(2), key(5)}, 20000); !ok || e.Tokens != 20000 || e.Name() != name(2, 20000) {
 		t.Errorf("after a torn line: %+v %v, want the file of the clean chain", e, ok)
 	}
 }

@@ -180,6 +180,7 @@ func (f *Fake) slot(w http.ResponseWriter, r *http.Request) {
 	action := r.URL.Query().Get("action")
 	f.actions = append(f.actions, action+" "+b.Filename)
 	status, kind, delay, tokens, entered := f.SlotStatus, f.SlotKind, f.SlotDelay, f.Tokens, f.entered
+	saveBytes := f.SaveBytes // read under the lock: the write below runs unlocked
 	if f.SavedTokens > 0 {
 		tokens = f.SavedTokens // the engine's own count of what it wrote
 	}
@@ -202,7 +203,7 @@ func (f *Fake) slot(w http.ResponseWriter, r *http.Request) {
 	}
 	p := filepath.Join(f.Dir, b.Filename)
 	if action == "save" {
-		n := f.SaveBytes
+		n := saveBytes
 		if n <= 0 {
 			n = 1000
 		}

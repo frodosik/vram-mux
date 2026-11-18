@@ -354,13 +354,13 @@ func (s *Store) Reserve(need int64) bool {
 // Lookup finds the file of the longest earlier turn of a conversation whose
 // prefix keys are keys (shortest first), in namespace namespace. A file that is
 // gone or changed size since it was indexed is dropped and the search goes on.
-// promptTokens is the requesting prompt's length. A prefix-key candidate points
-// to a file of a newer, possibly diverged chain, so one of more than
-// promptTokens tokens is skipped and the descent continues — the engine only
-// reuses a restored conversation when its live token count is a prefix of the
-// prompt. An exact last-key entry is the conversation's own turn boundary: its
-// chain is inside the request, so it passes unfiltered. promptTokens 0: the
-// length is unknown, prefix aliases are skipped.
+// promptTokens is the requesting prompt's length. The prefix index holds only
+// files saved when their key was terminal, so a prefix entry's count is the live
+// count of that turn; the engine reuses a restored conversation only when its
+// live count is a prefix of the prompt, so one of more than promptTokens tokens
+// is skipped and the descent continues. An exact last-key entry is the
+// conversation's own turn boundary: its chain is inside the request, so it passes
+// unfiltered. promptTokens 0: the length is unknown, prefix entries are skipped.
 func (s *Store) Lookup(namespace, fingerprint string, keys []string, promptTokens int) (Entry, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -385,33 +385,36 @@ func (s *Store) Lookup(namespace, fingerprint string, keys []string, promptToken
 	return Entry{}, false
 }
 
-// Covered reports whether a file of one of keys in namespace namespace holds at
-// least tokens tokens. A file of an earlier turn still counts: the engine reads
-// only what came after it. Prefix keys count as their turn-boundary file, so a
-// fork's later save is skipped when the shared prefix is already on disk.
+// Covered reports whether the conversation's own last key has a file of at least
+// tokens tokens: its turn-boundary file in entries, or the file saved when that
+// key was terminal, which is all the prefix index holds. Ancestor keys are never
+// consulted. A file keyed by an ancestor is a shallower conversation, and a
+// conversation that only shares an ancestor key with an older, deeper one is not
+// covered by it: sharing a 3,300-token system prompt with an 116k conversation
+// must not mark a 20k conversation on disk, because the engine cannot read a
+// longer file as a prefix of a shorter prompt.
 func (s *Store) Covered(namespace, fingerprint string, keys []string, tokens int) bool {
+	if len(keys) == 0 {
+		return false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, k := range keys {
-		id := namespace + "/" + fingerprint + "/" + k
-		e := s.entries[id]
-		if e == nil {
-			e = s.prefixes[id]
-		}
-		if e != nil && e.Tokens >= tokens {
-			return true
-		}
+	id := namespace + "/" + fingerprint + "/" + keys[len(keys)-1]
+	e := s.entries[id]
+	if e == nil {
+		e = s.prefixes[id]
 	}
-	return false
+	return e != nil && e.Tokens >= tokens
 }
 
 // Commit indexes the file the engine just saved as FileName(namespace,
 // fingerprint, keys[last], planned), renamed to carry the engine's own token
 // count when that differs. The files of the conversation's earlier turns are
 // superseded for the last key, and survive as turn-boundaries: each prefix key
-// moves to the prefix index pointing to the file that was saved for it, and a
-// prefix key with no such file aliases to this entry (Lookup's prompt filter
-// skips such an alias when its live count is longer than the prompt).
+// moves to the prefix index pointing to the file that was saved for it. A prefix
+// key with no file of its own stays empty — a prefix key at chain index i may
+// only name a file saved when keys[i] was that save's terminal key, never a
+// longer descendant file, so Lookup's prompt bound is never fooled by an alias.
 func (s *Store) Commit(namespace, fingerprint string, keys []string, planned, tokens int) (Entry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -434,8 +437,6 @@ func (s *Store) Commit(namespace, fingerprint string, keys []string, planned, to
 		if old := s.entries[id]; old != nil && old.Name() != e.Name() {
 			delete(s.entries, id)
 			s.prefixes[id] = old // the turn-boundary file keeps its key; the file stays
-		} else if s.prefixes[id] == nil {
-			s.prefixes[id] = e
 		}
 	}
 	s.entries[namespace+"/"+fingerprint+"/"+key] = e
@@ -480,10 +481,11 @@ func (s *Store) appendChain(namespace, fingerprint string, keys []string, e *Ent
 	}
 }
 
-// rebuildChains replays the chain side index at startup: every prefix key of a
-// line maps to the entry of the file the line names, when that file is in the
-// index with that name. Lines of files that are gone are dropped, and the
-// cleaned index is written back through the same atomic rename. mu held.
+// rebuildChains replays the chain side index at startup: a prefix key maps to
+// the entry of the file saved when it was terminal — the entry indexed by that
+// key. A key with no such file stays empty: the chain never rebuilds an alias
+// to a deeper file. Lines of files that are gone are dropped, and the cleaned
+// index is written back through the same atomic rename. mu held.
 func (s *Store) rebuildChains() {
 	raw, err := os.ReadFile(s.chainPath())
 	if err != nil {
@@ -508,7 +510,9 @@ func (s *Store) rebuildChains() {
 			}
 			id := l.Namespace + "/" + l.Fingerprint + "/" + k
 			if s.prefixes[id] == nil {
-				s.prefixes[id] = e
+				if pe := s.entries[id]; pe != nil {
+					s.prefixes[id] = pe // the file saved when this key was terminal
+				}
 			}
 		}
 		kept = append(kept, line)

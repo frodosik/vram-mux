@@ -239,19 +239,19 @@ func TestIdleSave(t *testing.T) {
 	if n := saves(e.f.Take()); n != 1 {
 		t.Fatalf("%d idle saves, want 1", n)
 	}
-	e.f.Set(22000, 0) // within regrow of the file
+	e.f.Set(22000, 0) // past the file's last key: the conversation is not covered
 	e.turn("A", 3)
 	time.Sleep(200 * time.Millisecond)
-	if n := saves(e.f.Take()); n != 0 {
-		t.Fatal("saved again within regrow")
+	if n := saves(e.f.Take()); n != 1 {
+		t.Fatal("the grown conversation was not saved at its own boundary")
 	}
 	e.f.Set(30000, 0)
 	e.turn("A", 4)
 	eventually(t, "a new save", func() bool { return saves(e.f.Take()) == 1 })
-	// The newest save supersedes the older for the last key; the older file
-	// survives as the turn boundary its key points to in the prefix index.
-	if e.files() != 2 {
-		t.Errorf("%d files, want the newest save plus the surviving turn-boundary file", e.files())
+	// Every save keys its own turn boundary, and the older files survive as the
+	// turn boundaries their keys point to in the prefix index.
+	if e.files() != 3 {
+		t.Errorf("%d files, want the save of each turn boundary", e.files())
 	}
 }
 
@@ -833,6 +833,68 @@ func longBody(words int) string {
 		`"},{"role":"user","content":"u"}]}`
 }
 
+// The turn-1 boundary below --min-tokens lands on disk — that is the shared root
+// a fork, a session with the same opening, or the summarizer restores — and its
+// bytes-per-token never reaches the route's estimate: the estimate is learned
+// only from a save of at least MinTokens, so the next long reserve is sized by
+// the measured big file, not by a small file's fixed overhead.
+func TestSmallRootSaveDoesNotPoisonBPT(t *testing.T) {
+	e := setup(t, 50*time.Millisecond, 64<<20)
+	e.p.cache.pol.MinTokens = 4096 // the arbiter's --min-tokens
+	e.f.Update(func(f *stratatest.Fake) { f.Tokens, f.SavedTokens, f.SaveBytes = 3309, 3309, 3309*3000 })
+
+	// A's chain is the turn-1 boundary: two keys, below MinTokens, above the floor
+	want(t, "the root conversation", e.turn("A", 1), actMiss)
+	eventually(t, "A's root file", func() bool { return e.files() == 1 })
+	if m, _ := filepath.Glob(filepath.Join(e.dir, "dc-*-3309.session")); len(m) != 1 {
+		t.Fatalf("the root boundary: %v, want A's file at 3309 tokens", m)
+	}
+	e.p.cache.mu.Lock()
+	bpt := e.p.cache.routes["strata/test-model"].bpt
+	e.p.cache.mu.Unlock()
+	if bpt != 0 {
+		t.Errorf("bytes per token %d after a save below MinTokens, want the untouched default", bpt)
+	}
+
+	// B's own boundary lands too, at the same count; its save is what switches A out
+	want(t, "the switch away from the root", e.turn("B", 1), actMiss)
+	eventually(t, "B's boundary file", func() bool { return e.files() == 2 })
+	e.p.cache.mu.Lock()
+	bpt = e.p.cache.routes["strata/test-model"].bpt
+	e.p.cache.mu.Unlock()
+	if bpt != 0 {
+		t.Errorf("bytes per token %d after two saves below MinTokens, want the untouched default", bpt)
+	}
+
+	// The first save worth saving teaches the route its own figure: the long
+	// file's ratio, never the small file's fixed overhead. The long conversation
+	// is too big to park, so its save runs at the switch.
+	time.Sleep(120 * time.Millisecond) // let the idle saves finish
+	e.f.Update(func(f *stratatest.Fake) { f.Tokens, f.SavedTokens, f.SaveBytes = 100000, 100000, 100000*13824 })
+	want(t, "the switch away from B", e.turn("C", 1), actMiss)
+	eventually(t, "the long file", func() bool { return e.files() == 3 })
+	e.p.cache.mu.Lock()
+	bpt = e.p.cache.routes["strata/test-model"].bpt
+	e.p.cache.mu.Unlock()
+	if bpt != 13824 {
+		t.Errorf("bytes per token %d, want the figure measured from the long save", bpt)
+	}
+}
+
+// The measured double prefill: a fresh session's launch prefills the engine, and
+// its next turn must continue the conversation the engine just built, paying for
+// its new messages only.
+func TestFreshSessionSecondTurnContinuesTheLiveSlot(t *testing.T) {
+	e := setup(t, 50*time.Millisecond, 64<<20)
+	e.f.Set(20248, 0)
+	want(t, "the launch request", e.turn("A", 4), actMiss)
+	e.f.Set(20834, 0)
+	want(t, "the next turn", e.turn("A", 5), actContinue)
+	if acts := e.f.Take(); saves(acts) != 0 || restores(acts) != 0 {
+		t.Fatalf("the second turn: %q, want the live slot continued with no save and no restore", acts)
+	}
+}
+
 // The single route built from --upstream answers every request, whatever the body
 // names. The request line carries the model that was asked for next to the route
 // that answered, so an alias is visible in the log and not only in the client's
@@ -963,14 +1025,16 @@ func TestForkRestoresPrefix(t *testing.T) {
 		t.Fatalf("restore past the deep boundary: %q, want one restore of the 130000-token file", acts)
 	}
 
-	// The switch away from f3: its save is covered by f2's file, the deeper boundary
+	// The switch away from f3: its last key has no file, so the deeper boundary
+	// is saved — f2's file covers only the chain f2 ended at, not f3's tail.
+	// Z, the conversation that switched the card, is saved at its own boundary.
 	e.f.Set(134096, 0)
 	want(t, "the switch away from f3", e.turn("Y", 1), actMiss)
-	if n := saves(e.f.Take()); n != 0 {
-		t.Fatalf("the switch away from f3: %d saves, want 0 covered by f2's file", n)
+	if n := saves(e.f.Take()); n != 1 {
+		t.Fatalf("the switch away from f3: %d saves, want 1 at its own boundary", n)
 	}
-	if !strings.Contains(e.logs.String(), `"reason":"on_disk"`) {
-		t.Error("a covered switch-away save was not skipped as on_disk")
+	if e.files() != 5 {
+		t.Fatalf("%d files, want A1, B, f2, Z and f3", e.files())
 	}
 }
 
@@ -1027,14 +1091,15 @@ func TestForkHandoffAt32k(t *testing.T) {
 		t.Fatalf("fork restore: %q, want one restore of %s", acts, filepath.Base(m[0]))
 	}
 
-	// The fork's switch-away: its own save is skipped as covered by the shared file
+	// The fork's switch-away: its last key has no file, so its own boundary is
+	// saved; the shared prefix file covers only the chain it was keyed to.
 	e.f.Set(104096, 0)
 	want(t, "the switch away from the fork", e.turn("Z", 1), actMiss)
-	if n := saves(e.f.Take()); n != 0 {
-		t.Fatalf("the switch away from the fork: %d saves, want 0 covered by the shared prefix", n)
+	if n := saves(e.f.Take()); n != 1 {
+		t.Fatalf("the switch away from the fork: %d saves, want 1 at its own boundary", n)
 	}
-	if !strings.Contains(e.logs.String(), `"reason":"on_disk"`) {
-		t.Error("the redundant save of the fork was not skipped as on_disk")
+	if m, _ := filepath.Glob(filepath.Join(e.dir, "dc-*-104096.session")); len(m) != 1 {
+		t.Fatalf("the fork's own boundary: %v, want one file at 104096 tokens", m)
 	}
 }
 

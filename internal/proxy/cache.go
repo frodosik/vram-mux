@@ -463,7 +463,15 @@ func (c *cache) skip(reason string, tokens int) {
 // it started anyway, and the index must know about it.
 func (c *cache) save(ctx context.Context, r *route, fp string, live []string, tokens int, trigger string) {
 	switch {
-	case tokens < c.pol.MinTokens:
+	// The first turn boundary — one or two chain keys — is saved below MinTokens
+	// when it carries real content (a quarter of MinTokens): its file is the
+	// shared opening a fork, a session with the same first messages, or the
+	// summarizer finds at a chain key, and a root of ~3,300 tokens is what a
+	// fresh launch restores from disk. A conversation of a few tokens is nobody's
+	// prefix, so the floor keeps it off the disk, and a small file never teaches
+	// the route's bytes-per-token: the guard below learns the estimate only from
+	// saves of at least MinTokens.
+	case tokens < c.pol.MinTokens && !(len(live) <= 2 && tokens >= c.pol.MinTokens/4):
 		c.skip("short", tokens)
 		return
 	case c.files.Covered(r.ns, fp, live, tokens-c.pol.RegrowTokens):
