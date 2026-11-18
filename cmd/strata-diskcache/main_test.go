@@ -18,19 +18,22 @@ import (
 )
 
 func TestConfig(t *testing.T) {
-	c, err := parse(nil)
+	c, err := parse([]string{"--strata-model", "flash"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if c.Listen != ":8080" || c.Upstream != "http://127.0.0.1:8081" || c.MaxGiB != 40 || c.RetentionDays != 7 ||
-		c.ParkMinTokens != -1 || c.Log.Output != "stderr" || !c.Log.Compress {
+		c.ParkMinTokens != -1 || c.GPUIndex != -1 || c.Log.Output != "stderr" || !c.Log.Compress {
 		t.Errorf("defaults: %+v", c)
+	}
+	if _, err := parse(nil); err == nil {
+		t.Error("an empty --strata-model with no --route accepted")
 	}
 
 	t.Setenv("SESSION_DIR", "/var/lib/sessions")
 	t.Setenv("MAX_GIB", "10")
 	t.Setenv("LOG_COMPRESS", "false")
-	c, err = parse([]string{"--max-gib", "20"})
+	c, err = parse([]string{"--strata-model", "flash", "--max-gib", "20"})
 	if err != nil || c.SessionDir != "/var/lib/sessions" || c.MaxGiB != 20 || c.Log.Compress {
 		t.Errorf("env, then the flag: %+v %v", c, err)
 	}
@@ -83,7 +86,7 @@ func TestShutdownMidSave(t *testing.T) {
 	f := stratatest.New(dir)
 	up := httptest.NewServer(f)
 	defer up.Close()
-	c, err := parse([]string{"--upstream", up.URL, "--session-dir", dir, "--idle-save-s", "0.02", "--shutdown-s", "5"})
+	c, err := parse([]string{"--upstream", up.URL, "--strata-model", "flash", "--session-dir", dir, "--idle-save-s", "0.02", "--shutdown-s", "5"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +143,7 @@ func TestRouteAPIKeyFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(routes) != 2 || routes[1].APIKey != "secret1" {
+	if len(routes) != 1 || routes[0].APIKey != "secret1" {
 		t.Errorf("api key from file: %+v", routes)
 	}
 
@@ -158,7 +161,7 @@ func TestRouteAPIKeyFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if routes, err := c.routes(); err != nil || routes[1].APIKey != "plain" {
+	if routes, err := c.routes(); err != nil || routes[0].APIKey != "plain" {
 		t.Errorf("plain key: %v %v", routes, err)
 	}
 }

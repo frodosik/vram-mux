@@ -74,7 +74,7 @@ type config struct {
 	MaxBodyMiB            int64   `name:"max-body-mib" env:"MAX_BODY_MIB" default:"64" help:"Generation request bodies larger than this are streamed through without caching."`
 	ShutdownS             float64 `name:"shutdown-s" env:"SHUTDOWN_S" default:"20" help:"On SIGTERM, how long running requests and a save under way get to finish."`
 
-	StrataModel   string `name:"strata-model" env:"STRATA_MODEL" default:"qwen3.8-flash-next-iq2_xs" help:"The model the Strata route answers for."`
+	StrataModel   string `name:"strata-model" env:"STRATA_MODEL" help:"The model the Strata route answers for. Required: it names the route id and the session namespace."`
 	StrataAPIKey  string `name:"strata-api-key" env:"STRATA_API_KEY" help:"Bearer token Strata needs, if any."`
 	StrataNeedMiB int64  `name:"strata-need-mib" env:"STRATA_NEED_MIB" default:"0" help:"VRAM the Strata route must have free to load: its floor, not what it fills (expert-cache auto sizes to the free VRAM it finds). 0: gate on the margin only."`
 
@@ -85,6 +85,7 @@ type config struct {
 	DrainWaitS        float64 `name:"drain-wait-s" env:"DRAIN_WAIT_S" default:"300" help:"How long a yield waits for a running turn to finish."`
 	LoadTimeoutS      float64 `name:"load-timeout-s" env:"LOAD_TIMEOUT_S" default:"600" help:"The whole swap: drain, free-VRAM gate, load."`
 	VRAMSysfs         string  `name:"vram-sysfs" env:"VRAM_SYSFS" default:"/sys/class/drm/card0/device" help:"The amdgpu device node the free-VRAM gate reads."`
+	GPUIndex          int64   `name:"gpu-index" env:"GPU_INDEX" default:"-1" help:"The card nvidia-smi answers for when no amdgpu card is found: -1 picks the card with the most VRAM."`
 	VRAMPollS         float64 `name:"vram-poll-s" env:"VRAM_POLL_S" default:"2" help:"How often the free-VRAM gate re-reads the card while it waits for a load."`
 	BodyDivisor       int     `name:"body-divisor" env:"BODY_DIVISOR" default:"4" help:"Request bytes per token, the estimate for an engine that reports no token count. 0: never estimate."`
 
@@ -109,8 +110,11 @@ func (c *config) Validate() error {
 	}
 	if c.MaxGiB <= 0 || c.RetentionDays <= 0 || c.MinTokens < 1 || c.SnapshotBytesPerToken <= 0 || c.MaxBodyMiB < 1 ||
 		c.ShutdownS <= 0 || c.MinFreeMiB < 0 || c.IdleSaveS < 0 || c.MaxIdleSaveTokens < 0 || c.RegrowTokens < 0 || c.Log.MaxSizeMiB < 1 ||
-		c.VRAMMarginMiB < 0 || c.VRAMPollS <= 0 || c.DrainWaitS <= 0 || c.LoadTimeoutS <= 0 || c.BodyDivisor < 0 || c.MaxResidentStreak < 0 {
-		return errors.New("sizes, limits and timeouts must be positive (--min-free-mib, --idle-save-s, --regrow-tokens, --max-resident-streak, --vram-margin-mib and --body-divisor may be 0)")
+		c.VRAMMarginMiB < 0 || c.VRAMPollS <= 0 || c.DrainWaitS <= 0 || c.LoadTimeoutS <= 0 || c.BodyDivisor < 0 || c.MaxResidentStreak < 0 || c.GPUIndex < -1 {
+		return errors.New("sizes, limits and timeouts must be positive (--min-free-mib, --idle-save-s, --regrow-tokens, --max-resident-streak, --vram-margin-mib, --body-divisor and --gpu-index may be -1)")
+	}
+	if c.StrataModel == "" && len(c.Routes) == 0 {
+		return errors.New("--strata-model is required, or give at least one --route")
 	}
 	return nil
 }
@@ -135,21 +139,25 @@ func resolveKey(spec string) (string, error) {
 }
 
 // routes is the arbiter's route list: the Strata route first (the resident a
-// request that names no model goes to), then each --route in order.
+// request that names no model goes to), then each --route in order. The Strata
+// route exists only when --strata-model is set, so a llama-only box needs none.
 func (c *config) routes() ([]arbiter.Route, error) {
 	strataKey, err := resolveKey(c.StrataAPIKey)
 	if err != nil {
 		return nil, err
 	}
-	out := []arbiter.Route{{
-		ID:        "strata/" + c.StrataModel,
-		Dialect:   "strata",
-		Model:     c.StrataModel,
-		Base:      c.Upstream,
-		APIKey:    strataKey,
-		Need:      c.StrataNeedMiB << 20,
-		Namespace: store.NamespaceOf("strata", c.StrataModel),
-	}}
+	var out []arbiter.Route
+	if c.StrataModel != "" {
+		out = append(out, arbiter.Route{
+			ID:        "strata/" + c.StrataModel,
+			Dialect:   "strata",
+			Model:     c.StrataModel,
+			Base:      c.Upstream,
+			APIKey:    strataKey,
+			Need:      c.StrataNeedMiB << 20,
+			Namespace: store.NamespaceOf("strata", c.StrataModel),
+		})
+	}
 	for _, spec := range c.Routes {
 		f := strings.Split(spec, "|")
 		if len(f) != 6 {
@@ -288,6 +296,7 @@ func serve(ctx context.Context, cfg *config, log *slog.Logger, proxyL, adminL ne
 		}
 	}
 	engine.SysfsVRAM = vramCard(cfg.VRAMSysfs, engine.DetectCard)
+	engine.NvidiaGPUIndex = cfg.GPUIndex
 	log.Info("vram gate", "card", engine.SysfsVRAM)
 	routes, err := cfg.routes()
 	if err != nil {
