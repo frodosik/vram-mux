@@ -1275,3 +1275,37 @@ func TestStaleLiveCountDoesNotAdmitTinySave(t *testing.T) {
 		t.Fatalf("%d files, want only the big conversation's boundary file", e.files())
 	}
 }
+
+// The root conversation's boundary file lands despite the route carrying a stale
+// big count, and the fork launch restores it. The idle cap and floor read the
+// engine's own count: the inherited 67,691 estimate would skip the 8,069-token
+// boundary as idle_too_long, and the fork would have nothing to restore.
+func TestRootBoundarySurvivesStaleBigCount(t *testing.T) {
+	e := setup(t, 100*time.Millisecond, 8<<30) // room for the 8k-token reserve
+	e.p.cache.pol.MinTokens = 4096
+	e.p.cache.pol.MaxIdleSaveTokens = 32768
+
+	// A leaves 67,691 tokens in the engine, so A's own idle save is over the cap
+	// and nothing lands. B arrives with the engine reporting 8,069: the cap reads
+	// the engine's count, not the 67,691 the route stored, and B's boundary file
+	// lands. A's file comes from the switch-save at B's prepare.
+	e.f.Set(67691, 0)
+	want(t, "the conversation that leaves a big count", e.turn("A", 1), actMiss)
+	time.Sleep(200 * time.Millisecond)
+	if e.files() != 0 {
+		t.Fatalf("%d files, want none: the big conversation is over the idle cap", e.files())
+	}
+	e.f.Set(8069, 0)
+	want(t, "the switch from A to B", e.turn("B", 1), actMiss)
+	eventually(t, "A's switch-save and B's boundary file", func() bool { return e.files() == 2 })
+	if m, _ := filepath.Glob(filepath.Join(e.dir, "dc-*-8069.session")); len(m) != 2 {
+		t.Fatalf("the boundary files: %v, want A's switch-save and B's own boundary", m)
+	}
+
+	// Z arrives far below the floor: B's switch-save is covered by B's own file,
+	// Z is short, and the fork launch restores B's boundary.
+	e.f.Set(60, 0)
+	want(t, "the switch away from B", e.turn("Z", 1), actMiss)
+	e.f.Set(8100, 0)
+	want(t, "the fork launch", e.turn("B", 2), actDisk)
+}

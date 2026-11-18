@@ -665,9 +665,15 @@ func (c *cache) idleSave(seq uint64) {
 	}
 	if st, err := r.eng.Status(c.ctx); err == nil && !c.restarted(r, st) {
 		own := st.LiveTokens // the engine's count for the conversation it just served
+		// The engine's own count is the size of the file it writes, so the idle cap
+		// and the short floor read it. The route's stored count is the conversation
+		// the engine served BEFORE this one, so a body estimate inherited from it
+		// skips a legitimate 8k boundary save as idle_too_long and admits a
+		// 64-token conversation as a prefix. The estimate is the fallback for a
+		// router that reports nothing.
 		tokens := own
-		if tokens < est {
-			tokens = est // the router reports none: keep the estimate
+		if tokens <= 0 {
+			tokens = est
 		}
 		if c.pol.MaxIdleSaveTokens > 0 && tokens > c.pol.MaxIdleSaveTokens {
 			c.skip("idle_too_long", tokens)
