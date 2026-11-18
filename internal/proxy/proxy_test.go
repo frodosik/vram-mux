@@ -1037,3 +1037,135 @@ func TestForkHandoffAt32k(t *testing.T) {
 		t.Error("the redundant save of the fork was not skipped as on_disk")
 	}
 }
+
+// TestForkHandoffGrownParent is the measured fork bug: the parent keeps the card
+// and grows past the fork point, so its checkpoint (70,611 tokens, committed
+// after the fork) registers prefix aliases for EVERY prefix key of its chain,
+// the fork-point hash included. A fork's prompt (~66,000 tokens) is SHORTER than
+// that file, so the engine reads the whole prompt after restoring it. The bound
+// is the prompt estimate only: the grown alias is skipped, and the fork restores
+// a file at or below the estimate — its own turn boundary when the store has one,
+// full prefill when it has none.
+func TestForkHandoffGrownParent(t *testing.T) {
+	e := setup(t, 50*time.Millisecond, 64<<20)
+	e.p.cache.pol.MaxIdleSaveTokens = 32768 // above the cap, saves fire only at switches
+
+	// The parent conversation: its prompt estimate is ~66,000 tokens.
+	e.f.Set(66000, 0)
+	a1 := longBody(52800)
+	if status, _ := e.post(context.Background(), "/v1/chat/completions", a1); status != 200 {
+		t.Fatalf("the long first request: status %d", status)
+	}
+	if act := e.last(); act != actMiss {
+		t.Fatalf("the long first request: %q, want %q", act, actMiss)
+	}
+	eventually(t, "the idle save above the cap is skipped",
+		func() bool { return strings.Contains(e.logs.String(), `"reason":"idle_too_long"`) })
+	if e.files() != 0 {
+		t.Fatalf("%d files: an idle save above the cap ran", e.files())
+	}
+
+	// The fork-point file: a new conversation switches the card away from a1,
+	// and a1 is saved at its own turn boundary, below the fork's estimate.
+	e.f.Set(65000, 0)
+	want(t, "the switch away from a1", e.turn("B", 1), actMiss)
+	if n := saves(e.f.Take()); n != 1 {
+		t.Fatalf("a1 at the switch: %d saves, want 1", n)
+	}
+	boundary, _ := filepath.Glob(filepath.Join(e.dir, "dc-*-65000.session"))
+	if len(boundary) != 1 {
+		t.Fatalf("the fork-point file: %v, want one at 65000 tokens", boundary)
+	}
+
+	// The parent takes the card back, continues past the fork point, and is
+	// saved at 70,611: every prefix key of its chain, the fork-point hash
+	// included, now aliases to the grown file.
+	e.f.Set(67000, 0)
+	a2 := forkOf(a1, "parent tail")
+	if status, _ := e.post(context.Background(), "/v1/chat/completions", a2); status != 200 {
+		t.Fatalf("the parent's next turn: status %d", status)
+	}
+	want(t, "the parent restores its own boundary", e.last(), actDisk)
+	e.f.Take()
+	e.f.Set(70611, 0)
+	a3 := forkOf(a2, "deeper parent")
+	if status, _ := e.post(context.Background(), "/v1/chat/completions", a3); status != 200 {
+		t.Fatalf("the parent's deeper turn: status %d", status)
+	}
+	want(t, "the deeper turn continues the card", e.last(), actContinue)
+	e.f.Take()
+	want(t, "the switch away from the grown parent", e.turn("C", 1), actMiss)
+	if n := saves(e.f.Take()); n != 1 {
+		t.Fatalf("the grown parent at the switch: %d saves, want 1", n)
+	}
+	if m, _ := filepath.Glob(filepath.Join(e.dir, "dc-*-70611.session")); len(m) != 1 {
+		t.Fatalf("the grown parent's file: %v, want one at 70611 tokens", m)
+	}
+
+	// A fork behind the grown file: its chain reaches the grown aliases, its
+	// prompt estimate is ~66,000, and the parent is live on the card at 70,611.
+	// The engine answers the restore with the file's own count, so the request
+	// line shows what the restore really carried.
+	e.f.Update(func(f *stratatest.Fake) { f.SavedTokens = 65000 })
+	e.f.Set(70611, 0)
+	f2 := forkOf(a2, "fork tail")
+	if status, _ := e.post(context.Background(), "/v1/chat/completions", f2); status != 200 {
+		t.Fatalf("the fork of the grown parent: status %d", status)
+	}
+	want(t, "the fork restores its own boundary", e.last(), actDisk)
+	acts := e.f.Take()
+	restored := ""
+	for _, a := range acts {
+		if strings.HasPrefix(a, "restore ") {
+			restored = a
+		}
+	}
+	if restores(acts) != 1 || !strings.Contains(restored, filepath.Base(boundary[0])) {
+		t.Fatalf("the fork restore: %q, want one restore of %s", acts, filepath.Base(boundary[0]))
+	}
+	if strings.Contains(restored, "-70611.session") {
+		t.Fatalf("the fork restored the grown parent's file: %q", acts)
+	}
+	if !strings.Contains(e.logs.String(), `"action":"disk","reason":"restored","tokens":65000`) {
+		t.Error("the fork's request line does not log the restored 65000-token boundary")
+	}
+
+	// A fork whose only copies are longer than its prompt pays full prefill: the
+	// grown parent's chain has no file at or below the estimate, so nothing is
+	// restored.
+	e.f.Update(func(f *stratatest.Fake) { f.SavedTokens = 0 })
+	fresh := `{"stream":true,"messages":[{"role":"system","content":"` + strings.Repeat("word ", 52800) +
+		`x"},{"role":"user","content":"u"}]}`
+	e.f.Set(66000, 0)
+	if status, _ := e.post(context.Background(), "/v1/chat/completions", fresh); status != 200 {
+		t.Fatalf("the fresh chain: status %d", status)
+	}
+	want(t, "the fresh chain", e.last(), actMiss)
+	e.f.Set(67000, 0)
+	fParent := forkOf(fresh, "parent tail")
+	if status, _ := e.post(context.Background(), "/v1/chat/completions", fParent); status != 200 {
+		t.Fatalf("the fresh parent's next turn: status %d", status)
+	}
+	want(t, "the fresh parent continues the card", e.last(), actContinue)
+	e.f.Take()
+	e.f.Set(70611, 0)
+	want(t, "the switch away from the fresh parent", e.turn("D", 1), actMiss)
+	if n := saves(e.f.Take()); n != 1 {
+		t.Fatalf("the fresh parent at the switch: %d saves, want 1", n)
+	}
+	if m, _ := filepath.Glob(filepath.Join(e.dir, "dc-*-70611.session")); len(m) != 2 {
+		t.Fatalf("the fresh parent's grown file: %v, want two files at 70611 tokens", m)
+	}
+	e.f.Set(70611, 0)
+	fFork := forkOf(fresh, "fork tail")
+	if status, _ := e.post(context.Background(), "/v1/chat/completions", fFork); status != 200 {
+		t.Fatalf("the fork of the fresh parent: status %d", status)
+	}
+	want(t, "the fork pays full prefill", e.last(), actMiss)
+	if acts := e.f.Take(); restores(acts) != 0 {
+		t.Fatalf("the fork of the fresh parent restored %q, want no restore", acts)
+	}
+	if strings.Contains(e.logs.String(), `"action":"disk","reason":"restored","tokens":70611`) {
+		t.Error("the arbiter restored the grown 70611-token file for a shorter fork prompt")
+	}
+}

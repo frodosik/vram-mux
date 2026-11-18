@@ -293,17 +293,18 @@ func (c *cache) prepare(ctx context.Context, path string, body []byte, r *route)
 	var file store.Entry
 	var onDisk bool
 	if !inRAM {
-		// The prompt length as the cache estimates it: a conversation that
-		// shares the prefix of the saved one has a prompt at least as long as
-		// the engine's live count, so max(body estimate, live) is a usable
-		// bound, and Lookup skips files longer than it. 0 (no estimate,
-		// --body-divisor 0): prefix aliases are skipped.
+		// The prompt estimate is the only bound: the engine reuses a restored
+		// conversation only when its live count is a prefix of the prompt, so a
+		// file longer than the estimate can never be reused. The engine's live
+		// count is NOT a bound — a fork request shares the parent's prefix, and
+		// the parent can grow past the fork point, so the fork's prompt can be
+		// SHORTER than the live count; admitting the parent's file there restores
+		// a conversation the engine reads whole. 0 (no estimate, --body-divisor
+		// 0): prefix aliases are skipped. Lookup's exact last-key entry — the
+		// conversation's own turn boundary — passes unfiltered.
 		m := 0
 		if c.pol.BodyDivisor > 0 {
 			m = len(body) / c.pol.BodyDivisor
-		}
-		if r.liveTokens > m {
-			m = r.liveTokens
 		}
 		file, onDisk = c.files.Lookup(r.ns, fp, keys, m)
 	}
