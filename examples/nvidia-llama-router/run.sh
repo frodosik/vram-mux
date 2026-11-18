@@ -1,8 +1,10 @@
 #!/bin/bash -eu
-# NVIDIA, llama.cpp routes only: one router, two presets, one card. Strata is
-# left out because its stack targets ROCm; llama.cpp is native to NVIDIA. The
-# arbiter reads free VRAM from nvidia-smi: install nvidia-smi, set --gpu-index
-# to pin a card (-1 picks the one with most VRAM), keep --vram-poll-s at 2 s.
+# NVIDIA: a pure llama.cpp router setup, one router, two presets, one card.
+# Strata + llama-server runs on NVIDIA CUDA exactly as in ../amd-strata-llama,
+# with --gpu-index for the free-VRAM gate; this example shows the llama half.
+# The arbiter reads free VRAM from nvidia-smi when no amdgpu card answers:
+# install nvidia-smi, set --gpu-index to pin a card (-1 picks the most VRAM),
+# keep --vram-poll-s at 2 s.
 
 SESSIONS=/var/lib/gpu-arbiter/sessions
 

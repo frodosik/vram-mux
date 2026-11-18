@@ -1,4 +1,6 @@
-# NVIDIA, llama.cpp routes only (Strata targets ROCm, so this box runs no Strata).
+# NVIDIA: a pure llama.cpp router setup (one router, two presets, one card).
+# Strata + llama-server runs on NVIDIA CUDA exactly as in
+# ../amd-strata-llama, with --gpu-index; this unit shows the llama half.
 # Run as the user the engines run as. The VRAM
 # gate uses the nvidia-smi backend: install nvidia-smi and keep it readable for
 # this user. --gpu-index pins a card; -1 picks the one with most VRAM.

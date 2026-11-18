@@ -161,7 +161,7 @@ line each. Prompt and answer text is never logged.
 ## Limitations
 
 - **One card.** Multi-GPU is not implemented: the arbiter owns one card, all routes share it.
-- **VRAM gate:** amdgpu sysfs (`mem_vram`), with a nvidia-smi fallback; NVIDIA needs `nvidia-smi` installed.
+- **VRAM gate:** amdgpu sysfs (`mem_info_vram_total` / `mem_info_vram_used`), with a nvidia-smi fallback; NVIDIA needs `nvidia-smi` installed and `--gpu-index` to pin a card. Strata + llama-server runs on NVIDIA CUDA the same way as on AMD.
 Pinned to Strata v0.1.45–v0.1.61 slot APIs: `POST /slots/0?action=save|restore`, `parallel` at 1, `slot_save_path`, `/v1/status`
   and the JSON `/metrics`. A later engine change makes the proxy fail open into a pass-through.
 - A route that reports no token count (llama.cpp) uses the `--body-divisor` estimate for its saves.
