@@ -1234,3 +1234,44 @@ func TestForkHandoffGrownParent(t *testing.T) {
 		t.Error("the arbiter restored the grown 70611-token file for a shorter fork prompt")
 	}
 }
+
+// A conversation of a few tokens is nobody's prefix: the floor keeps it off disk.
+func TestFewTokenConversationIsNotSaved(t *testing.T) {
+	e := setup(t, 50*time.Millisecond, 64<<20)
+	e.p.cache.pol.MinTokens = 4096
+	e.f.Set(64, 0)
+	want(t, "the tiny conversation", e.turn("A", 1), actMiss)
+	time.Sleep(200 * time.Millisecond)
+	if n := saves(e.f.Take()); n != 0 {
+		t.Fatalf("the tiny conversation: %d saves, want 0 below the floor", n)
+	}
+	if e.files() != 0 {
+		t.Fatalf("%d files, want none for a conversation below the floor", e.files())
+	}
+}
+
+// A few-token conversation arriving after a big one on the same route inherits
+// the route's stored count. The short rule reads the engine's own count for the
+// conversation, so the inherited count admits nothing: a 236 MB file of a 64-token
+// conversation is nobody's prefix, and the route's byte estimate stays with the big file.
+func TestStaleLiveCountDoesNotAdmitTinySave(t *testing.T) {
+	e := setup(t, 50*time.Millisecond, 64<<20)
+	e.p.cache.pol.MinTokens = 4096
+	e.f.Set(8069, 0)
+	want(t, "the big conversation", e.turn("A", 2), actMiss)
+	eventually(t, "the big boundary file", func() bool { return e.files() == 1 })
+	if n := saves(e.f.Take()); n != 1 {
+		t.Fatalf("the big conversation: %d saves, want its own boundary file", n)
+	}
+
+	// The engine now serves a 64-token conversation; the route still carries 8069.
+	e.f.Set(64, 0)
+	want(t, "the tiny conversation", e.turn("B", 1), actMiss)
+	time.Sleep(200 * time.Millisecond)
+	if n := saves(e.f.Take()); n != 0 {
+		t.Fatalf("the tiny conversation: %d saves, want 0 with the route count inherited", n)
+	}
+	if e.files() != 1 {
+		t.Fatalf("%d files, want only the big conversation's boundary file", e.files())
+	}
+}

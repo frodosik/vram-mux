@@ -314,7 +314,7 @@ func (c *cache) prepare(ctx context.Context, path string, body []byte, r *route)
 		if t.prevParks && !onDisk {
 			c.skip("parks", live)
 		} else {
-			c.save(ctx, r, fp, r.live, live, "switch")
+			c.save(ctx, r, fp, r.live, live, live, "switch")
 		}
 	}
 	switch {
@@ -373,7 +373,7 @@ func (c *cache) SaveLive(ctx context.Context, r arbiter.Route) {
 	}
 	c.saveMu.Lock()
 	defer c.saveMu.Unlock()
-	c.save(context.WithoutCancel(ctx), rt, fp, live, tokens, "yield")
+	c.save(context.WithoutCancel(ctx), rt, fp, live, tokens, tokens, "yield")
 }
 
 // invalidate forgets every route's live conversation: a request the cache didn't
@@ -461,7 +461,17 @@ func (c *cache) skip(reason string, tokens int) {
 // save writes the live conversation to disk unless it is short, already on disk
 // or doesn't fit. It outlives the request's context: the engine finishes a save
 // it started anyway, and the index must know about it.
-func (c *cache) save(ctx context.Context, r *route, fp string, live []string, tokens int, trigger string) {
+func (c *cache) save(ctx context.Context, r *route, fp string, live []string, tokens, own int, trigger string) {
+	// The short rule reads the conversation's OWN token count: a route's stored
+	// count is the conversation the engine last served, so a few-token
+	// conversation arriving after a 8,000-token one inherits that count and would
+	// be admitted as a prefix. The engine's own count is the only figure that
+	// says what this conversation holds. The reserve and Covered use the route's
+	// count, which sizes the file.
+	ownTokens := own
+	if ownTokens <= 0 {
+		ownTokens = tokens
+	}
 	switch {
 	// The first turn boundary — one or two chain keys — is saved below MinTokens
 	// when it carries real content (a quarter of MinTokens): its file is the
@@ -471,8 +481,8 @@ func (c *cache) save(ctx context.Context, r *route, fp string, live []string, to
 	// prefix, so the floor keeps it off the disk, and a small file never teaches
 	// the route's bytes-per-token: the guard below learns the estimate only from
 	// saves of at least MinTokens.
-	case tokens < c.pol.MinTokens && !(len(live) <= 2 && tokens >= c.pol.MinTokens/4):
-		c.skip("short", tokens)
+	case ownTokens < c.pol.MinTokens && !(len(live) <= 2 && ownTokens >= c.pol.MinTokens/4):
+		c.skip("short", ownTokens)
 		return
 	case c.files.Covered(r.ns, fp, live, tokens-c.pol.RegrowTokens):
 		c.skip("on_disk", tokens)
@@ -654,7 +664,8 @@ func (c *cache) idleSave(seq uint64) {
 		return
 	}
 	if st, err := r.eng.Status(c.ctx); err == nil && !c.restarted(r, st) {
-		tokens := st.LiveTokens
+		own := st.LiveTokens // the engine's count for the conversation it just served
+		tokens := own
 		if tokens < est {
 			tokens = est // the router reports none: keep the estimate
 		}
@@ -662,7 +673,7 @@ func (c *cache) idleSave(seq uint64) {
 			c.skip("idle_too_long", tokens)
 			return
 		}
-		c.save(c.ctx, r, fp, live, tokens, "idle")
+		c.save(c.ctx, r, fp, live, tokens, own, "idle")
 	}
 }
 
