@@ -298,7 +298,11 @@ func serve(ctx context.Context, cfg *config, log *slog.Logger, proxyL, adminL ne
 	}
 	engine.SysfsVRAM = vramCard(cfg.VRAMSysfs, engine.DetectCard)
 	engine.NvidiaGPUIndex = cfg.GPUIndex
-	log.Info("vram gate", "card", engine.SysfsVRAM)
+	if _, err := engine.SysfsFree(); err == nil {
+		log.Info("vram gate", "backend", "sysfs", "card", engine.SysfsVRAM)
+	} else {
+		log.Info("vram gate", "backend", "nvidia-smi", "gpu_index", cfg.GPUIndex)
+	}
 	routes, err := cfg.routes()
 	if err != nil {
 		return err

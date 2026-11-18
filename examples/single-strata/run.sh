@@ -1,5 +1,5 @@
 #!/bin/bash -eu
-# Single engine, single route: the upstream gpu-arbiter setup. Strata on
+# Single engine, single route: the upstream strata-diskcache setup. Strata on
 # :8095 with session files, the proxy on :8080, no arbiter, no card sharing.
 
 SESSIONS=/var/lib/gpu-arbiter/sessions

@@ -298,3 +298,25 @@ func TestVRAMCardSelection(t *testing.T) {
 		t.Errorf("a detect that found nothing: %s", got)
 	}
 }
+
+// ROUTES is the env form of --route, split on spaces by kong's sep tag, so a
+// systemd unit gets multi-route from one Environment line with no quoting. A
+// comma inside a route spec is one value, not two routes.
+
+func TestRoutesEnvSeparates(t *testing.T) {
+	t.Setenv("ROUTES", "llama|llama/27b|swift|http://127.0.0.1:8001||18000 llama|llama/orca|orca|http://127.0.0.1:8002||9000")
+	c, err := parse([]string{"--strata-model", "flash"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes, err := c.routes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 3 {
+		t.Fatalf("ROUTES env: %d routes, want strata + 2 llama: %+v", len(routes), routes)
+	}
+	if routes[2].ID != "llama/orca" || routes[2].Need != 9000<<20 {
+		t.Errorf("second route from env: %+v", routes[2])
+	}
+}

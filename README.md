@@ -10,14 +10,22 @@ Strict mode is on: a request must name a model the arbiter serves. A model it do
 ## Quick start
 
 Go 1.26 or newer. Each engine must have session files turned on (Strata: `"slot_save_path"` / `--slot-save-path DIR`,
-`parallel` at 1; llama.cpp: `--persistent` slots).
+`parallel` at 1; llama.cpp: a router with `--slot-save-path DIR`, `--models-preset presets.ini`, `--models-max 1` and `--no-models-autoload`).
 
 ```sh
 go install github.com/frodosik/gpu-arbiter/cmd/gpu-arbiter@latest
 
-# One card, two routes: Strata on :8095, llama-server on :8001
-# --upstream + --strata-model build the Strata route (the resident), each
-# --route adds one more. A llama-only box omits both.
+# Engines first. The llama route is a router: presets loaded on demand, slots
+# persisted, nothing preloaded (a preloaded model takes the card at once).
+llama-server --models-preset /etc/gpu-arbiter/presets.ini --models-max 1 \
+  --no-models-autoload --slot-save-path /var/lib/gpu-arbiter/sessions \
+  --host 127.0.0.1 --port 8001 & # no api key: the route's api-key field is empty
+strata --serve --host 127.0.0.1 --port 8095 \
+  --native /srv/models/flash-next-iq2_xs.gguf \
+  --slot-save-path /var/lib/gpu-arbiter/sessions --parallel 1 &
+
+# The arbiter: Strata route from --upstream + --strata-model (the resident),
+# each --route adds one more. A llama-only box omits both.
 gpu-arbiter \
   --upstream http://127.0.0.1:8095 --strata-model qwen3.8-flash-next-iq2_xs \
   --route "llama|llama/27b|qwen3.8-27b|http://127.0.0.1:8001||18000" \
@@ -30,7 +38,7 @@ Run it as the user the engines run as, so it can delete the files they write. `e
 
 ## Results
 
-One RDNA3 card (24 GiB VRAM, 30 GiB RAM), Strata v0.1.45 with resident experts, binary `d30a76b`, time to first token as the
+One RDNA3 card (24 GiB VRAM, 30 GiB RAM), Strata v0.1.61 with resident experts, binary `d30a76b`, time to first token as the
 client sees it:
 
 | scenario | tokens | reused + read | time |
@@ -114,7 +122,7 @@ Every flag also has its UPPERCASE env var; the flag wins.
 | `--strata-model` | `STRATA_MODEL` | (empty) | the model the Strata route answers for; required with a Strata route |
 | `--strata-api-key` | `STRATA_API_KEY` | (empty) | bearer token, plain or `file:PATH` so it never appears in `ps` |
 | `--strata-need-mib` | `STRATA_NEED_MIB` | `0` | VRAM the Strata route needs to load: its floor, not what it fills; `0` = gate on margin only |
-| `--route` | `ROUTES` | (empty) | one per occurrence: `dialect\|id\|model\|base\|api-key\|need-mib`; dialects `strata` and `llama` |
+| `--route` | `ROUTES` | (empty) | one per occurrence: `dialect\|id\|model\|base\|api-key\|need-mib`; dialects `strata` and `llama`. `ROUTES` is space-separated, so one systemd `Environment=` line carries several routes (a comma inside a spec is one value) |
 | `--max-resident-streak` | `MAX_RESIDENT_STREAK` | `32` | resident requests drained before a waiter takes the card; `0` = unbounded |
 | `--vram-margin-mib` | `VRAM_MARGIN_MIB` | `1024` | free VRAM that must remain before a route loads |
 | `--drain-wait-s` | `DRAIN_WAIT_S` | `300` | how long a yield waits for a running turn |
@@ -154,7 +162,7 @@ line each. Prompt and answer text is never logged.
 
 - **One card.** Multi-GPU is not implemented: the arbiter owns one card, all routes share it.
 - **VRAM gate:** amdgpu sysfs (`mem_vram`), with a nvidia-smi fallback; NVIDIA needs `nvidia-smi` installed.
-- Pinned to Strata v0.1.45 slot APIs: `POST /slots/0?action=save|restore`, `parallel` at 1, `slot_save_path`, `/v1/status`
+Pinned to Strata v0.1.45–v0.1.61 slot APIs: `POST /slots/0?action=save|restore`, `parallel` at 1, `slot_save_path`, `/v1/status`
   and the JSON `/metrics`. A later engine change makes the proxy fail open into a pass-through.
 - A route that reports no token count (llama.cpp) uses the `--body-divisor` estimate for its saves.
 - There is no header-only chain key, so summarizer-style prompts that share only the system prompt get no reuse.
@@ -173,7 +181,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Provenance and Acknowledgements
 
-`gpu-arbiter` is the evolution of [tfyl/gpu-arbiter](https://github.com/tfyl/gpu-arbiter) (MIT, © 2026 tfyl),
+`gpu-arbiter` is the evolution of [tfyl/strata-diskcache](https://github.com/tfyl/strata-diskcache) (MIT, © 2026 tfyl),
 the single-engine disk cache this project grew from. Fork point: upstream `709faf6` ("feat: initial release"). The upstream
 remains the home of single-Strata deployments; `examples/single-strata/` is that setup, and the store, keying, save/restore
 policy and fail-open behavior are its design, carried forward with the multi-route arbiter, strict mode, the free-VRAM gate,

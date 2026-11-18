@@ -1,4 +1,5 @@
-# NVIDIA, llama.cpp routes only. Run as the user the engines run as. The VRAM
+# NVIDIA, llama.cpp routes only (Strata targets ROCm, so this box runs no Strata).
+# Run as the user the engines run as. The VRAM
 # gate uses the nvidia-smi backend: install nvidia-smi and keep it readable for
 # this user. --gpu-index pins a card; -1 picks the one with most VRAM.
 
@@ -14,7 +15,9 @@ Group=model
 Environment=LISTEN=:8080
 Environment=METRICS_LISTEN=127.0.0.1:8082
 Environment=SESSION_DIR=/var/lib/gpu-arbiter/sessions
-Environment=ROUTES=llama|llama/27b|qwen3.8-27b|http://127.0.0.1:8001||18000 llama|llama/orcacyber|orcacyber-security-reviewer|http://127.0.0.1:8002||9000
+# ROUTES is space-separated: kong splits env values on spaces, so several
+# routes fit one Environment line. Both routes live on the same router.
+Environment=ROUTES=llama|llama/27b|qwen3.8-27b|http://127.0.0.1:8001||18000 llama|llama/orcacyber|orcacyber-security-reviewer|http://127.0.0.1:8001||9000
 Environment=MAX_GIB=40
 Environment=MIN_TOKENS=15000
 Environment=REGROW_TOKENS=4096

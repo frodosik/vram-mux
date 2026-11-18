@@ -1,4 +1,4 @@
-/strata-diskcache
+/gpu-arbiter
 /dist/
 *.test
 *.out

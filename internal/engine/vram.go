@@ -60,17 +60,27 @@ func DetectCard() string {
 // arbiter's margin gate is measured against. The amdgpu sysfs node is preferred
 // (zero fork); a box with no amdgpu card gets nvidia-smi.
 func FreeVRAM() (int64, error) {
-	total, err := readSysfs(SysfsVRAM + "/mem_info_vram_total")
-	if err == nil {
-		used, err := readSysfs(SysfsVRAM + "/mem_info_vram_used")
-		if err == nil {
-			if total < used {
-				return 0, nil
-			}
-			return total - used, nil
-		}
+	if n, err := SysfsFree(); err == nil {
+		return n, nil
 	}
 	return freeNvidia()
+}
+
+// SysfsFree reads the amdgpu node only, so the startup log can say which backend
+// answers before any load.
+func SysfsFree() (int64, error) {
+	total, err := readSysfs(SysfsVRAM + "/mem_info_vram_total")
+	if err != nil {
+		return 0, err
+	}
+	used, err := readSysfs(SysfsVRAM + "/mem_info_vram_used")
+	if err != nil {
+		return 0, err
+	}
+	if total < used {
+		return 0, nil
+	}
+	return total - used, nil
 }
 
 // freeNvidia parses nvidia-smi's csv rows "index, free, total" in MiB: --gpu-index
@@ -86,7 +96,14 @@ func freeNvidia() (int64, error) {
 		if len(f) < 3 {
 			continue
 		}
-		idx, free, total := parseNum(f[0]), parseNum(f[1]), parseNum(f[2])
+		idx, ok1 := parseNum(f[0])
+		free, ok2 := parseNum(f[1])
+		total, ok3 := parseNum(f[2])
+		// A row like "0, [Not Supported], [Not Supported]" is not a card: a
+		// row that does not parse end to end is skipped, not read as 0 free.
+		if !(ok1 && ok2 && ok3) {
+			continue
+		}
 		if idx == NvidiaGPUIndex {
 			return free << 20, nil
 		}
@@ -100,9 +117,9 @@ func freeNvidia() (int64, error) {
 	return best, nil
 }
 
-func parseNum(s string) int64 {
-	n, _ := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
-	return n
+func parseNum(s string) (int64, bool) {
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	return n, err == nil
 }
 
 // readSysfs reads one amdgpu file: a decimal, optionally suffixed with " MiB".

@@ -4,6 +4,7 @@
 
 ### Added
 
+- Install path: `go install github.com/frodosik/gpu-arbiter/cmd/gpu-arbiter@latest`.
 - **The project is `gpu-arbiter`** (module `github.com/frodosik/gpu-arbiter`): one GPU shared by
   several engine processes, with the arbiter owning model loads, the drain queue, and the free-VRAM
   gate. The metrics namespace is `gpu_arbiter_*`.
@@ -69,7 +70,7 @@
   whose client walked away while it waited for the card is not counted: no record, no counter, no 503 body.
 
 - **Flags take two dashes** (`--session-dir`, not `-session-dir`). The environment variables are unchanged.
-- `go install` path is now `github.com/tfyl/gpu-arbiter/cmd/gpu-arbiter@latest`.
+- `go install` path is now `github.com/tfyl/strata-diskcache/cmd/strata-diskcache@latest`.
 - Session files are named `dc-<fingerprint>-<key>-<tokens>.session`. Files in the first version's format are
   deleted at start.
 - `strata_diskcache_save_seconds` and `strata_diskcache_restore_seconds` are histograms now (`_sum` as before, plus

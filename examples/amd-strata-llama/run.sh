@@ -24,10 +24,14 @@ strata --serve --host 127.0.0.1 --port 8095 \
   --prefill 6656 --spec 4 --spec-min-p 0.5 --resident-budget-gib 10.0 \
   --session-min-free-mib 512 &
 
-# llama.cpp server for the 27B route. Slots must be persistent so the arbiter
-# can save and restore them.
-llama-server -m /srv/models/qwen3.8-27b.gguf \
-  --host 127.0.0.1 --port 8001 --ctx-size 32768 --slots --persistent &
+# The llama route is a router, not a server with a model loaded: presets load on
+# demand through POST /models/load, slots persist so the arbiter can save and
+# restore them, and nothing is preloaded - a preloaded model takes the card at
+# once and the arbiter's free-VRAM gate has nothing left for Strata. No api key
+# here: the route's api-key field is empty, so a key on the router would answer
+# the arbiter with 401. Give both the same key if you want one.
+llama-server --models-preset ./presets.ini --models-max 1 --no-models-autoload \
+  --slot-save-path "$SESSIONS" --host 127.0.0.1 --port 8001 &
 
 # The arbiter: clients on :8080, admin on 127.0.0.1:8082.
 # --max-gib 80 bounds the session files; --min-tokens 4096 saves turns of 4k+

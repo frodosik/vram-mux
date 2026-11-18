@@ -1,6 +1,6 @@
 # Design notes
 
-## What Strata gives us (v0.1.45)
+## What Strata gives us (v0.1.45, the slot APIs verified through v0.1.61)
 
 - `POST /slots/0?action=save` writes the **live** conversation (the last request's) to a file. A conversation
   parked in RAM can't be saved.

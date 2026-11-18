@@ -115,3 +115,32 @@ func TestFreeVRAMPrefersSysfs(t *testing.T) {
 		t.Errorf("sysfs preferred: %d %v", free, err)
 	}
 }
+
+func TestFreeVRAMSkipsUnparseableNvidiaRows(t *testing.T) {
+	oldVRAM, oldSmi, oldIdx := SysfsVRAM, NvidiaSmi, NvidiaGPUIndex
+	SysfsVRAM = filepath.Join(t.TempDir(), "card9", "device")
+	NvidiaSmi = func(context.Context) ([]byte, error) {
+		return []byte("0, [Not Supported], [Not Supported]\n"), nil
+	}
+	NvidiaGPUIndex = int64(-1)
+	defer func() { SysfsVRAM, NvidiaSmi, NvidiaGPUIndex = oldVRAM, oldSmi, oldIdx }()
+
+	if _, err := FreeVRAM(); err == nil {
+		t.Error("a [Not Supported] row read as 0 free VRAM")
+	}
+}
+
+func TestFreeVRAMPicksTheGoodRow(t *testing.T) {
+	oldVRAM, oldSmi, oldIdx := SysfsVRAM, NvidiaSmi, NvidiaGPUIndex
+	SysfsVRAM = filepath.Join(t.TempDir(), "card9", "device")
+	NvidiaSmi = func(context.Context) ([]byte, error) {
+		return []byte("0, [Not Supported], [Not Supported]\n1, 22000, 24576\n"), nil
+	}
+	NvidiaGPUIndex = int64(-1)
+	defer func() { SysfsVRAM, NvidiaSmi, NvidiaGPUIndex = oldVRAM, oldSmi, oldIdx }()
+
+	free, err := FreeVRAM()
+	if err != nil || free != 22000<<20 {
+		t.Errorf("row 1 after a bad row: %d %v, want 22000 MiB", free, err)
+	}
+}
