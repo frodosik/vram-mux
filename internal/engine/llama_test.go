@@ -102,7 +102,7 @@ func (m *llamaMock) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			v.Data = append(v.Data, me)
 		}
 		b, _ := json.Marshal(v)
-		_, _ = io.WriteString(w, string(b))
+		_, _ = w.Write(b)
 	case r.Method == http.MethodPost && r.URL.Path == "/slots/0":
 		if m.slotStatus != 0 {
 			msg := m.slotErr

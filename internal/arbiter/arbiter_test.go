@@ -48,8 +48,6 @@ type fakeEngine struct {
 	restoreToke int
 }
 
-func (f *fakeEngine) calls() []string { return f.card.callsSince(0) }
-
 // loads counts the load calls the card recorded.
 func loads(calls []string) (n int) {
 	for _, c := range calls {
@@ -75,17 +73,17 @@ func (f *fakeEngine) CacheInfo(context.Context) (engine.CacheInfo, error) {
 	return engine.CacheInfo{}, nil
 }
 
-func (f *fakeEngine) Save(ctx context.Context, name string) (int, int64, error) {
+func (f *fakeEngine) Save(_ context.Context, name string) (int, int64, error) {
 	f.card.record("save " + f.id + " " + name)
 	return f.saveTokens, 1000, nil
 }
 
-func (f *fakeEngine) Restore(ctx context.Context, name string) (int, int64, error) {
+func (f *fakeEngine) Restore(_ context.Context, name string) (int, int64, error) {
 	f.card.record("restore " + f.id + " " + name)
 	return f.restoreToke, 1000, nil
 }
 
-func (f *fakeEngine) Load(ctx context.Context) error {
+func (f *fakeEngine) Load(_ context.Context) error {
 	f.card.record("load " + f.id)
 	if f.loadErr != nil {
 		return f.loadErr
@@ -96,7 +94,7 @@ func (f *fakeEngine) Load(ctx context.Context) error {
 	return nil
 }
 
-func (f *fakeEngine) Unload(ctx context.Context, wait time.Duration) error {
+func (f *fakeEngine) Unload(_ context.Context, wait time.Duration) error {
 	f.card.record("unload " + f.id + " " + wait.String())
 	if f.unloadErr != nil {
 		return f.unloadErr
@@ -349,9 +347,9 @@ func TestStreakCapBreaksStarvation(t *testing.T) {
 	_ = b
 }
 
-// A cancelled waiter leaves no phantom in the queue: once its request ends, the
+// A canceled waiter leaves no phantom in the queue: once its request ends, the
 // next request of the resident drains straight through.
-func TestCancelledWaitLeavesNoPhantom(t *testing.T) {
+func TestCanceledWaitLeavesNoPhantom(t *testing.T) {
 	c := &card{free: 20 << 30}
 	ar, _, _ := newTest(t, c, 32)
 	ar.resident = "strata/flash"
@@ -365,7 +363,7 @@ func TestCancelledWaitLeavesNoPhantom(t *testing.T) {
 	awaitQueued(t, ar, 1)
 	cancel()
 	if err := <-waiter.err; err == nil {
-		t.Fatal("a cancelled waiter was admitted")
+		t.Fatal("a canceled waiter was admitted")
 	}
 	hold.release()
 	next := do(context.Background(), ar, "flash")
@@ -382,7 +380,7 @@ func TestSwapOrderSaveUnloadLoad(t *testing.T) {
 	c := &card{free: 20 << 30}
 	ar, a, b := newTest(t, c, 32)
 	ar.resident = a.id
-	ar.opt.SaveLive = func(ctx context.Context, r Route) { a.card.record("yield " + r.ID) }
+	ar.opt.SaveLive = func(_ context.Context, r Route) { a.card.record("yield " + r.ID) }
 
 	r := do(context.Background(), ar, "27b")
 	if m := <-r.admitted; m != "27b" {

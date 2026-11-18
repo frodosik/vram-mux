@@ -101,7 +101,7 @@ func freeNvidia() (int64, error) {
 		total, ok3 := parseNum(f[2])
 		// A row like "0, [Not Supported], [Not Supported]" is not a card: a
 		// row that does not parse end to end is skipped, not read as 0 free.
-		if !(ok1 && ok2 && ok3) {
+		if !ok1 || !ok2 || !ok3 {
 			continue
 		}
 		if idx == NvidiaGPUIndex {

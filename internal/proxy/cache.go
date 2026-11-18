@@ -440,7 +440,7 @@ func (c *cache) inRAM(r *route, keys []string) bool {
 // on the switch away from it. It evicts parked ones to make room, so it refuses
 // only one bigger than the whole budget, or one that leaves less than the RAM
 // floor even with every parked one evicted.
-func (c *cache) willPark(tokens int, en engine.CacheInfo, r *route) bool {
+func (c *cache) willPark(tokens int, en engine.CacheInfo, _ *route) bool {
 	minTokens := c.pol.ParkMinTokens
 	if minTokens < 0 {
 		minTokens = en.MinTokens
@@ -481,7 +481,7 @@ func (c *cache) save(ctx context.Context, r *route, fp string, live []string, to
 	// prefix, so the floor keeps it off the disk, and a small file never teaches
 	// the route's bytes-per-token: the guard below learns the estimate only from
 	// saves of at least MinTokens.
-	case ownTokens < c.pol.MinTokens && !(len(live) <= 2 && ownTokens >= c.pol.MinTokens/4):
+	case ownTokens < c.pol.MinTokens && (len(live) > 2 || ownTokens < c.pol.MinTokens/4):
 		c.skip("short", ownTokens)
 		return
 	case c.files.Covered(r.ns, fp, live, tokens-c.pol.RegrowTokens):

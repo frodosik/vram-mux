@@ -295,7 +295,7 @@ func twoRouteEnvWith(t *testing.T, o envOpts) (*Proxy, *stratatest.Fake, *llamaF
 }
 
 // postModel sends a named model's request and returns the status.
-func postModel(t *testing.T, url, model string, body string) int {
+func postModel(t *testing.T, url string, _ string, body string) int {
 	t.Helper()
 	req, _ := http.NewRequest(http.MethodPost, url+"/v1/chat/completions", strings.NewReader(body))
 	resp, err := http.DefaultClient.Do(req)
@@ -309,7 +309,7 @@ func postModel(t *testing.T, url, model string, body string) int {
 			n++
 		}
 	}
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		return resp.StatusCode
 	}
 	return n
@@ -1065,6 +1065,6 @@ func TestClientGoneWhileWaitingIsNotADenial(t *testing.T) {
 		t.Errorf(`requests_total{action="denied"} = %v, want no denial counted`, v)
 	}
 	if llama.Take() != nil {
-		t.Error("the cancelled request touched the 27B engine")
+		t.Error("the canceled request touched the 27B engine")
 	}
 }

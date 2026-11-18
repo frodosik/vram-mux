@@ -222,11 +222,12 @@ func (a *Arbiter) Acquire(ctx context.Context, model string) (Route, func(), err
 		}
 		// Single-route mode: the one route answers every request, whatever the body
 		// names. The proxy logs the requested model, so the aliasing is visible.
-		if a.resident != "" {
+		switch {
+		case a.resident != "":
 			r = a.byID[a.resident]
-		} else if len(a.opt.Routes) > 0 {
+		case len(a.opt.Routes) > 0:
 			r = a.opt.Routes[0]
-		} else {
+		default:
 			return Route{}, nil, &NoRoute{Model: model}
 		}
 	}

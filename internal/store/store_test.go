@@ -245,7 +245,7 @@ func TestAnyFingerprintTie(t *testing.T) {
 	if err := s.Load(); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 20; i++ { // map order is randomised: the tie must break the same way
+	for i := 0; i < 20; i++ { // map order is randomized: the tie must break the same way
 		if got := s.AnyFingerprint(ns); got != "bbbbbbbbbbbb" {
 			t.Fatalf("AnyFingerprint = %q, want the higher file name for the same mtime", got)
 		}

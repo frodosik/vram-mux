@@ -14,7 +14,7 @@ linters:
     - usestdlibvars
   settings:
     misspell:
-      locale: UK
+      locale: US # the code and comments are US English throughout
     revive:
       rules:
         - name: exported
