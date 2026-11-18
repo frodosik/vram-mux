@@ -293,7 +293,19 @@ func (c *cache) prepare(ctx context.Context, path string, body []byte, r *route)
 	var file store.Entry
 	var onDisk bool
 	if !inRAM {
-		file, onDisk = c.files.Lookup(r.ns, fp, keys)
+		// The prompt length as the cache estimates it: a conversation that
+		// shares the prefix of the saved one has a prompt at least as long as
+		// the engine's live count, so max(body estimate, live) is a usable
+		// bound, and Lookup skips files longer than it. 0 (no estimate,
+		// --body-divisor 0): prefix aliases are skipped.
+		m := 0
+		if c.pol.BodyDivisor > 0 {
+			m = len(body) / c.pol.BodyDivisor
+		}
+		if r.liveTokens > m {
+			m = r.liveTokens
+		}
+		file, onDisk = c.files.Lookup(r.ns, fp, keys, m)
 	}
 	if r.live != nil {
 		t.prev, t.tokens = r.live, live

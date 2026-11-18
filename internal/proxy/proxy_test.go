@@ -248,8 +248,10 @@ func TestIdleSave(t *testing.T) {
 	e.f.Set(30000, 0)
 	e.turn("A", 4)
 	eventually(t, "a new save", func() bool { return saves(e.f.Take()) == 1 })
-	if e.files() != 1 {
-		t.Errorf("%d files: the newer save did not supersede the older one", e.files())
+	// The newest save supersedes the older for the last key; the older file
+	// survives as the turn boundary its key points to in the prefix index.
+	if e.files() != 2 {
+		t.Errorf("%d files, want the newest save plus the surviving turn-boundary file", e.files())
 	}
 }
 
@@ -876,5 +878,162 @@ func TestModelOfReadsATruncatedPrefix(t *testing.T) {
 	}
 	if got := modelOf([]byte(`{"tools":[{"model":"x"}],"stream":true}`)); got != "" {
 		t.Errorf("nested model key: %q, want empty: only the top level names the model", got)
+	}
+}
+
+// forkOf extends a body by one user message: its chain shares the whole prefix.
+func forkOf(body, tail string) string {
+	return strings.TrimSuffix(body, `]}`) + `,{"role":"user","content":"` + tail + `"}]}`
+}
+
+// A fork whose chain reaches a saved turn boundary gets the file of the deepest
+// boundary with live ≤ prompt restored: longer files on the way down are
+// skipped, a fork that extends the live card pays nothing, and the fork's own
+// switch-away save is skipped as covered by the shared prefix.
+func TestForkRestoresPrefix(t *testing.T) {
+	e := setup(t, 50*time.Millisecond, 64<<20)
+	e.p.cache.pol.MaxIdleSaveTokens = 32768 // above the cap, saves fire only at switches
+	e.f.Set(124000, 0)
+	a1 := longBody(100000)
+	if status, _ := e.post(context.Background(), "/v1/chat/completions", a1); status != 200 {
+		t.Fatalf("the long first request: status %d", status)
+	}
+	if act := e.last(); act != actMiss {
+		t.Fatalf("the long first request: %q, want %q", act, actMiss)
+	}
+	eventually(t, "the idle save above the cap is skipped",
+		func() bool { return strings.Contains(e.logs.String(), `"reason":"idle_too_long"`) })
+	if e.files() != 0 {
+		t.Fatalf("%d files: an idle save above the cap ran", e.files())
+	}
+
+	// B switches away from A1: A1 is saved at the switch, keyed by its last key
+	want(t, "the switch to B", e.turn("B", 1), actMiss)
+	if n := saves(e.f.Take()); n != 1 {
+		t.Fatalf("A1 at the switch: %d saves, want 1", n)
+	}
+	m, _ := filepath.Glob(filepath.Join(e.dir, "dc-*.session"))
+	if len(m) != 1 || !strings.Contains(filepath.Base(m[0]), "-124000.session") {
+		t.Fatalf("A1's file: %v, want one file at 124000 tokens", m)
+	}
+
+	// A fork of A1 does not extend B, so it switches: the lookup descends past
+	// B's key to A1's, 124000 ≤ the fork's prompt, and the restore fires
+	e.f.Set(124000, 0)
+	f1 := forkOf(a1, "fork tail")
+	if status, _ := e.post(context.Background(), "/v1/chat/completions", f1); status != 200 {
+		t.Fatalf("the fork of A1: status %d", status)
+	}
+	want(t, "fork restore from A1's file", e.last(), actDisk)
+	if acts := e.f.Take(); restores(acts) != 1 || !strings.Contains(strings.Join(acts, " "), filepath.Base(m[0])) {
+		t.Fatalf("fork restore: %q, want one restore of %s", acts, filepath.Base(m[0]))
+	}
+
+	// A fork of the fork extends the live card: the engine keeps it, no save, no restore
+	f2 := forkOf(f1, "next tail")
+	e.f.Set(126000, 0)
+	if status, _ := e.post(context.Background(), "/v1/chat/completions", f2); status != 200 {
+		t.Fatalf("the fork of the fork: status %d", status)
+	}
+	want(t, "the deeper fork extends live", e.last(), actContinue)
+	if n := saves(e.f.Take()); n != 0 {
+		t.Fatalf("the switch away from f1: %d saves, want 0 covered by A1's file", n)
+	}
+
+	// Z switches away: f2 is saved at the switch, the deeper boundary at 130000
+	e.f.Set(130000, 0)
+	want(t, "the switch away from f2", e.turn("Z", 1), actMiss)
+	if n := saves(e.f.Take()); n != 1 {
+		t.Fatalf("f2 at the switch: %d saves, want 1", n)
+	}
+	if e.files() != 3 {
+		t.Fatalf("%d files, want A1, B and f2", e.files())
+	}
+
+	// A fork behind the deep boundary: the engine's live count is the prompt's
+	// lower bound, so the deepest prefix file is at the fork's prompt and is the
+	// restore target, exactly as the engine can reuse it.
+	f3 := forkOf(f2, "deeper tail")
+	e.f.Set(130000, 0)
+	if status, _ := e.post(context.Background(), "/v1/chat/completions", f3); status != 200 {
+		t.Fatalf("the fork behind the deep boundary: status %d", status)
+	}
+	want(t, "the fork restores the deepest prefix at its prompt", e.last(), actDisk)
+	if acts := e.f.Take(); restores(acts) != 1 || !strings.Contains(strings.Join(acts, " "), "-130000.session") {
+		t.Fatalf("restore past the deep boundary: %q, want one restore of the 130000-token file", acts)
+	}
+
+	// The switch away from f3: its save is covered by f2's file, the deeper boundary
+	e.f.Set(134096, 0)
+	want(t, "the switch away from f3", e.turn("Y", 1), actMiss)
+	if n := saves(e.f.Take()); n != 0 {
+		t.Fatalf("the switch away from f3: %d saves, want 0 covered by f2's file", n)
+	}
+	if !strings.Contains(e.logs.String(), `"reason":"on_disk"`) {
+		t.Error("a covered switch-away save was not skipped as on_disk")
+	}
+}
+
+// --max-idle-save-tokens 32768 skips the idle save of a live conversation above
+// the cap. The switch-save is what a new conversation gets, and the fork that
+// arrives after it restores A1's file: the handoff pays one save, not a full
+// re-prefill.
+func TestForkHandoffAt32k(t *testing.T) {
+	e := setup(t, 50*time.Millisecond, 64<<20)
+	e.p.cache.pol.MaxIdleSaveTokens = 32768
+	e.f.Set(100000, 0)
+	a1 := longBody(100000)
+	if status, _ := e.post(context.Background(), "/v1/chat/completions", a1); status != 200 {
+		t.Fatalf("the long first request: status %d", status)
+	}
+	if act := e.last(); act != actMiss {
+		t.Fatalf("the long first request: %q, want %q", act, actMiss)
+	}
+	eventually(t, "the idle save above the cap is skipped",
+		func() bool { return strings.Contains(e.logs.String(), `"reason":"idle_too_long"`) })
+	if e.files() != 0 {
+		t.Fatalf("%d files: an idle save above the cap ran", e.files())
+	}
+
+	// A fork of the live conversation continues it: no save, no restore
+	f1 := forkOf(a1, "fork tail")
+	if status, _ := e.post(context.Background(), "/v1/chat/completions", f1); status != 200 {
+		t.Fatalf("the fork of the live conversation: status %d", status)
+	}
+	want(t, "fork extends live", e.last(), actContinue)
+	if acts := e.f.Take(); saves(acts) != 0 || restores(acts) != 0 {
+		t.Fatalf("fork extends live: %q, want no save and no restore", acts)
+	}
+
+	// A new conversation switches away from the fork: the switch-save fires
+	// above the idle cap, before the new request is served
+	want(t, "the new conversation", e.turn("B", 1), actMiss)
+	if n := saves(e.f.Take()); n != 1 {
+		t.Fatalf("the switch away from the fork: %d saves, want 1", n)
+	}
+	m, _ := filepath.Glob(filepath.Join(e.dir, "dc-*.session"))
+	if len(m) != 1 || !strings.Contains(filepath.Base(m[0]), "-100000.session") {
+		t.Fatalf("the switch-save file: %v, want one file at 100000 tokens", m)
+	}
+
+	// A fork sharing the saved chain restores it: 100000 ≤ the fork's prompt
+	e.f.Set(100400, 0)
+	f2 := forkOf(f1, "next tail")
+	if status, _ := e.post(context.Background(), "/v1/chat/completions", f2); status != 200 {
+		t.Fatalf("the fork after the switch: status %d", status)
+	}
+	want(t, "fork restore from the saved chain", e.last(), actDisk)
+	if acts := e.f.Take(); restores(acts) != 1 || !strings.Contains(strings.Join(acts, " "), filepath.Base(m[0])) {
+		t.Fatalf("fork restore: %q, want one restore of %s", acts, filepath.Base(m[0]))
+	}
+
+	// The fork's switch-away: its own save is skipped as covered by the shared file
+	e.f.Set(104096, 0)
+	want(t, "the switch away from the fork", e.turn("Z", 1), actMiss)
+	if n := saves(e.f.Take()); n != 0 {
+		t.Fatalf("the switch away from the fork: %d saves, want 0 covered by the shared prefix", n)
+	}
+	if !strings.Contains(e.logs.String(), `"reason":"on_disk"`) {
+		t.Error("the redundant save of the fork was not skipped as on_disk")
 	}
 }

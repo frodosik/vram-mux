@@ -33,14 +33,14 @@ func TestRealFolderFromTheDeployedBuild(t *testing.T) {
 		t.Fatalf("the deployed folder did not load: %d files %d bytes", n, b)
 	}
 	key := "2df95693013de4d041c5301f4058efbd8dfd9e96f61c8fcd81c1fa52dfa3e049"
-	if _, ok := s.Lookup("", "eb98614d3db3", []string{key}); !ok {
+	if _, ok := s.Lookup("", "eb98614d3db3", []string{key}, 200000); !ok {
 		t.Fatal("the conversation is not found in the legacy namespace")
 	}
 	ns := NamespaceOf("strata", "qwen3.8-flash-next-iq2_xs")
 	if moved := s.Adopt(ns, "eb98614d3db3"); moved != 3 {
 		t.Fatalf("Adopt moved %d files, want 3", moved)
 	}
-	if _, ok := s.Lookup(ns, "eb98614d3db3", []string{key}); !ok {
+	if _, ok := s.Lookup(ns, "eb98614d3db3", []string{key}, 200000); !ok {
 		t.Fatal("the adopted conversation is not found in the route namespace")
 	}
 }
