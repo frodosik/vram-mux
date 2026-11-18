@@ -1,22 +1,39 @@
 package engine
 
 import (
+	"context"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // VRAM is read from the amdgpu sysfs node: the card is shared by every engine,
 // so the arbiter gates on the real free memory, not on one engine's idea of it.
-// Paths are settable for tests.
+// Paths are settable for tests. With no amdgpu card on the box the gate falls
+// back to nvidia-smi, whose runner is settable for tests.
 
 // SysfsVRAM is the amdgpu device node for the card the engines share.
 var SysfsVRAM = "/sys/class/drm/card0/device"
 
 // SysfsRoot is where the DRM cards live; settable for tests.
 var SysfsRoot = "/sys/class/drm"
+
+// NvidiaGPUIndex pins the card nvidia-smi answers for, -1 = the largest card.
+var NvidiaGPUIndex int64 = -1
+
+// NvidiaSmi runs the query and returns its stdout: "index, free, total" per
+// line, MiB. Settable for tests.
+var NvidiaSmi = func(ctx context.Context) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, "nvidia-smi",
+		"--query-gpu=index,memory.free,memory.total", "--format=csv,noheader,nounits").Output()
+}
 
 // DetectCard names the device node of the card with the most VRAM: on a box with
 // an integrated GPU the discrete card is card1, so a fixed card0 path reads
@@ -40,20 +57,52 @@ func DetectCard() string {
 }
 
 // FreeVRAM returns bytes free on the card: total - used. It is the figure the
-// arbiter's margin gate is measured against.
+// arbiter's margin gate is measured against. The amdgpu sysfs node is preferred
+// (zero fork); a box with no amdgpu card gets nvidia-smi.
 func FreeVRAM() (int64, error) {
 	total, err := readSysfs(SysfsVRAM + "/mem_info_vram_total")
+	if err == nil {
+		used, err := readSysfs(SysfsVRAM + "/mem_info_vram_used")
+		if err == nil {
+			if total < used {
+				return 0, nil
+			}
+			return total - used, nil
+		}
+	}
+	return freeNvidia()
+}
+
+// freeNvidia parses nvidia-smi's csv rows "index, free, total" in MiB: --gpu-index
+// picks that card, -1 picks the card with the most VRAM.
+func freeNvidia() (int64, error) {
+	out, err := NvidiaSmi(context.Background())
 	if err != nil {
 		return 0, err
 	}
-	used, err := readSysfs(SysfsVRAM + "/mem_info_vram_used")
-	if err != nil {
-		return 0, err
+	best, bestTotal := int64(0), int64(-1)
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Split(line, ",")
+		if len(f) < 3 {
+			continue
+		}
+		idx, free, total := parseNum(f[0]), parseNum(f[1]), parseNum(f[2])
+		if idx == NvidiaGPUIndex {
+			return free << 20, nil
+		}
+		if total > bestTotal {
+			best, bestTotal = free<<20, total
+		}
 	}
-	if total < used {
-		return 0, nil
+	if bestTotal < 0 {
+		return 0, errors.New("nvidia-smi answered no card")
 	}
-	return total - used, nil
+	return best, nil
+}
+
+func parseNum(s string) int64 {
+	n, _ := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	return n
 }
 
 // readSysfs reads one amdgpu file: a decimal, optionally suffixed with " MiB".

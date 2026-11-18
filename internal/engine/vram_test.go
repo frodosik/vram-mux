@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -47,7 +49,69 @@ func TestDetectCardWithNothingReadable(t *testing.T) {
 		t.Errorf("an empty sysfs root answered %s", got)
 	}
 	SysfsVRAM = filepath.Join(root, "card9", "device")
+	oldSmi, oldIdx := NvidiaSmi, NvidiaGPUIndex
+	NvidiaSmi, NvidiaGPUIndex = func(context.Context) ([]byte, error) {
+		return nil, errors.New("no nvidia-smi on this box")
+	}, -1
+	defer func() { NvidiaSmi, NvidiaGPUIndex = oldSmi, oldIdx }()
 	if _, err := FreeVRAM(); err == nil {
 		t.Error("a card that is not there read as free VRAM")
+	}
+}
+
+// With no amdgpu card the gate asks nvidia-smi; its runner is settable.
+
+func TestFreeVRAMFallsBackToNvidia(t *testing.T) {
+	oldVRAM, oldSmi, oldIdx := SysfsVRAM, NvidiaSmi, NvidiaGPUIndex
+	SysfsVRAM = filepath.Join(t.TempDir(), "card9", "device")
+	NvidiaSmi = func(context.Context) ([]byte, error) {
+		return []byte("0, 23950, 24576\n1, 12000, 24576\n"), nil
+	}
+	NvidiaGPUIndex = int64(-1)
+	defer func() { SysfsVRAM, NvidiaSmi, NvidiaGPUIndex = oldVRAM, oldSmi, oldIdx }()
+
+	free, err := FreeVRAM()
+	if err != nil || free != 23950<<20 {
+		t.Errorf("largest card: %d %v, want 23950 MiB", free, err)
+	}
+	NvidiaGPUIndex = int64(1)
+	free, err = FreeVRAM()
+	if err != nil || free != 12000<<20 {
+		t.Errorf("--gpu-index 1: %d %v, want 12000 MiB", free, err)
+	}
+}
+
+func TestFreeVRAMUnparseableNvidiaAnswer(t *testing.T) {
+	oldVRAM, oldSmi := SysfsVRAM, NvidiaSmi
+	SysfsVRAM = filepath.Join(t.TempDir(), "card9", "device")
+	NvidiaSmi = func(context.Context) ([]byte, error) { return []byte("no gpu here\n"), nil }
+	defer func() { SysfsVRAM, NvidiaSmi = oldVRAM, oldSmi }()
+
+	if _, err := FreeVRAM(); err == nil {
+		t.Error("an unparseable nvidia-smi answer read as free VRAM")
+	}
+}
+
+func TestFreeVRAMPrefersSysfs(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "card1", "device")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, v := range map[string]string{"mem_info_vram_total": "25753026560\n", "mem_info_vram_used": "1000\n"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(v), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldVRAM, oldSmi := SysfsVRAM, NvidiaSmi
+	SysfsVRAM, NvidiaSmi = dir, func(context.Context) ([]byte, error) {
+		t.Error("the amdgpu card answered, nvidia-smi must not be called")
+		return nil, errors.New("called")
+	}
+	defer func() { SysfsVRAM, NvidiaSmi = oldVRAM, oldSmi }()
+
+	free, err := FreeVRAM()
+	if err != nil || free != 25753026560-1000 {
+		t.Errorf("sysfs preferred: %d %v", free, err)
 	}
 }
