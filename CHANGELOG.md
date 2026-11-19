@@ -4,6 +4,10 @@
 
 ### Added
 
+- **The project is `vram-mux`** (module `github.com/frodosik/vram-mux`, command and binary `vram-mux`,
+  `go install github.com/frodosik/vram-mux/cmd/vram-mux@latest`): the same proxy, named for what it does — multiplexing
+  one GPU across engine processes. Flags, env vars, the session-file names `dc-*.session` and the keying salt are
+  unchanged, so an existing session folder and an existing command line work with only the binary name to change.
 - Install path: `go install github.com/frodosik/gpu-arbiter/cmd/gpu-arbiter@latest`.
 - **The project is `gpu-arbiter`** (module `github.com/frodosik/gpu-arbiter`): one GPU shared by
   several engine processes, with the arbiter owning model loads, the drain queue, and the free-VRAM
@@ -23,6 +27,16 @@
 
 ### Changed
 
+- **The Prometheus namespace is `vram_mux_*`** — `vram_mux_files`, `vram_mux_bytes`, `vram_mux_max_bytes`,
+  `vram_mux_requests_total{action}`, `vram_mux_saves_total`, `vram_mux_restores_total`,
+  `vram_mux_swaps_total`, `vram_mux_resident_info{route,model}`, `vram_mux_queue_length` and the rest replace the
+  `gpu_arbiter_*` series. Dashboards, recording rules and alerts naming the old series must be renamed. The `/requests`
+  action field stays `diskcache` — it names the cache component, not the project, and consumers of that JSON keep working.
+- `--log-file` defaults to `/var/log/vram-mux/vram-mux.log`; the example systemd unit is `vram-mux.service`, and the
+  paths in `contrib/` and `examples/` are `/var/lib/vram-mux/sessions` and `/etc/vram-mux/api.keys`.
+- **The chain-key salt stays `"strata-diskcache v1\0"`,** the upstream's name. It is the chain root every saved file's
+  keys derive from, so a rename would invalidate every `.session` file on disk; the comment in `internal/proxy/key.go`
+  says so. `github.com/tfyl/strata-diskcache` stays credited at fork point `709faf6`.
 - `Covered` ("already on disk") consults **only the last chain key** of the request, never ancestor
   keys: a new conversation that shares a system prompt with an older one is no longer treated as
   cached, and its turn-boundary file is written.

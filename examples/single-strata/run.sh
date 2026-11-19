@@ -2,8 +2,8 @@
 # Single engine, single route: the upstream strata-diskcache setup. Strata on
 # :8095 with session files, the proxy on :8080, no arbiter, no card sharing.
 
-SESSIONS=/var/lib/gpu-arbiter/sessions
-API_KEYS=/etc/gpu-arbiter/api.keys
+SESSIONS=/var/lib/vram-mux/sessions
+API_KEYS=/etc/vram-mux/api.keys
 
 # Strata with slot files turned on and parallel at 1 (session files need it).
 strata --serve --host 127.0.0.1 --port 8095 \
@@ -15,7 +15,7 @@ strata --serve --host 127.0.0.1 --port 8095 \
 # route answers for, --strata-api-key reads the key from a file so it never
 # appears in ps. The idle save writes turn-boundary files; the yield save
 # writes the file a switch would lose.
-gpu-arbiter \
+vram-mux \
   --listen :8080 --metrics-listen 127.0.0.1:8082 \
   --upstream http://127.0.0.1:8095 \
   --strata-model qwen3.8-flash-next-iq2_xs \

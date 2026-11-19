@@ -1,4 +1,4 @@
-module github.com/frodosik/gpu-arbiter
+module github.com/frodosik/vram-mux
 
 go 1.26.0
 

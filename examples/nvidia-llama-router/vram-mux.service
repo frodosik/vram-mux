@@ -6,7 +6,7 @@
 # this user. --gpu-index pins a card; -1 picks the one with most VRAM.
 
 [Unit]
-Description=gpu-arbiter (NVIDIA, llama.cpp routes, disk conversation cache)
+Description=vram-mux (NVIDIA, llama.cpp routes, disk conversation cache)
 After=network-online.target llama-server.service llama-server2.service
 Wants=llama-server.service llama-server2.service
 
@@ -16,7 +16,7 @@ User=model
 Group=model
 Environment=LISTEN=:8080
 Environment=METRICS_LISTEN=127.0.0.1:8082
-Environment=SESSION_DIR=/var/lib/gpu-arbiter/sessions
+Environment=SESSION_DIR=/var/lib/vram-mux/sessions
 # ROUTES is space-separated: kong splits env values on spaces, so several
 # routes fit one Environment line. Both routes live on the same router.
 Environment=ROUTES=llama|llama/27b|qwen3.8-27b|http://127.0.0.1:8001||18000 llama|llama/orcacyber|orcacyber-security-reviewer|http://127.0.0.1:8001||9000
@@ -36,7 +36,7 @@ Environment=LOAD_TIMEOUT_S=600
 Environment=LOG_OUTPUT=stderr
 Environment=LOG_FORMAT=json
 Environment=LOG_LEVEL=info
-ExecStart=/usr/local/bin/gpu-arbiter
+ExecStart=/usr/local/bin/vram-mux
 Restart=always
 RestartSec=5
 

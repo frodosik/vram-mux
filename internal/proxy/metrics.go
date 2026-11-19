@@ -6,10 +6,10 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/frodosik/gpu-arbiter/internal/store"
+	"github.com/frodosik/vram-mux/internal/store"
 )
 
-// Metrics are the proxy's Prometheus metrics, all gpu_arbiter_*.
+// Metrics are the proxy's Prometheus metrics, all vram_mux_*.
 type Metrics struct {
 	requests, savesBy, skipped, failures, evictions, evictedBytes, reloads *prometheus.CounterVec
 	saves, restores, savedBytes, restoredBytes, panics                     prometheus.Counter
@@ -29,7 +29,7 @@ type Metrics struct {
 // NewMetrics registers the metrics with reg.
 func NewMetrics(reg prometheus.Registerer) *Metrics {
 	opts := func(name, help string) prometheus.Opts {
-		return prometheus.Opts{Namespace: "gpu_arbiter", Name: name, Help: help}
+		return prometheus.Opts{Namespace: "vram_mux", Name: name, Help: help}
 	}
 	vec := func(name, help string, labels ...string) *prometheus.CounterVec {
 		return prometheus.NewCounterVec(prometheus.CounterOpts(opts(name, help)), labels)
@@ -38,7 +38,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		return prometheus.NewCounter(prometheus.CounterOpts(opts(name, help)))
 	}
 	hist := func(name, help string) prometheus.Histogram {
-		return prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: "gpu_arbiter", Name: name, Help: help,
+		return prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: "vram_mux", Name: name, Help: help,
 			Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60}})
 	}
 	m := &Metrics{
@@ -58,7 +58,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		prefillTokens:  counter("re_prefill_tokens_total", "Tokens of requests that ran with no session to restore, an estimate of what a swap cost in re-prefill."),
 		saveSeconds:    hist("save_seconds", "Time to save a session file."),
 		restoreSeconds: hist("restore_seconds", "Time to restore a session file."),
-		swapSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: "gpu_arbiter", Name: "swap_seconds",
+		swapSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: "vram_mux", Name: "swap_seconds",
 			Help: "Time from the yield to the new route being resident.", Buckets: []float64{1, 3, 10, 30, 60, 120, 300, 600}}),
 		swapBlocked: vec("swap_blocked_total", "A swap that did not happen, by reason.", "reason"),
 		queue:       prometheus.NewGauge(prometheus.GaugeOpts(opts("queue_length", "Requests waiting for the card."))),
@@ -82,7 +82,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 // WatchStore exports the store's file count, total size and cap.
 func (m *Metrics) WatchStore(reg prometheus.Registerer, st *store.Store, maxBytes int64) {
 	gauge := func(name, help string, f func() float64) prometheus.Collector {
-		return prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: "gpu_arbiter", Name: name, Help: help}, f)
+		return prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: "vram_mux", Name: name, Help: help}, f)
 	}
 	reg.MustRegister(
 		gauge("files", "Session files on disk.", func() float64 { n, _ := st.Stats(); return float64(n) }),

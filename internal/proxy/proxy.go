@@ -20,8 +20,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/frodosik/gpu-arbiter/internal/arbiter"
-	"github.com/frodosik/gpu-arbiter/internal/store"
+	"github.com/frodosik/vram-mux/internal/arbiter"
+	"github.com/frodosik/vram-mux/internal/store"
 )
 
 // Options configure the proxy.

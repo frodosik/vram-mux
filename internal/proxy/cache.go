@@ -7,10 +7,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/frodosik/gpu-arbiter/internal/arbiter"
-	"github.com/frodosik/gpu-arbiter/internal/engine"
-	"github.com/frodosik/gpu-arbiter/internal/store"
-	"github.com/frodosik/gpu-arbiter/internal/strata"
+	"github.com/frodosik/vram-mux/internal/arbiter"
+	"github.com/frodosik/vram-mux/internal/engine"
+	"github.com/frodosik/vram-mux/internal/store"
+	"github.com/frodosik/vram-mux/internal/strata"
 )
 
 // Policy tunes when the cache saves.

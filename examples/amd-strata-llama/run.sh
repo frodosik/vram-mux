@@ -1,11 +1,11 @@
 #!/bin/bash -eu
 # One RDNA3 card, two routes: Strata (resident experts) and a llama.cpp 27B,
-# with gpu-arbiter owning the loads. Run as the user the engines run as.
+# with vram-mux owning the loads. Run as the user the engines run as.
 # The card is shared: the arbiter drains the resident route, yields, gates on
 # free VRAM, and loads the requested model.
 
-SESSIONS=/var/lib/gpu-arbiter/sessions
-API_KEYS=/etc/gpu-arbiter/api.keys
+SESSIONS=/var/lib/vram-mux/sessions
+API_KEYS=/etc/vram-mux/api.keys
 
 # Strata's engine settings, exported before the launch:
 export STRATA_RESIDENT_HEADROOM_GIB=2.6
@@ -44,7 +44,7 @@ llama-server --models-preset ./presets.ini --models-max 1 --no-models-autoload \
 # reports none; --max-resident-streak 32 drains the resident before a waiter
 # takes the card; --vram-margin-mib 1024 must stay free before any load;
 # --drain-wait-s 300, --load-timeout-s 600 cover a whole swap.
-gpu-arbiter \
+vram-mux \
   --listen :8080 --metrics-listen 127.0.0.1:8082 \
   --session-dir "$SESSIONS" \
   --upstream http://127.0.0.1:8095 --strata-model qwen3.8-flash-next-iq2_xs \

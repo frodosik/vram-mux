@@ -55,7 +55,10 @@ func (k *keyer) keys(path string, raw []byte) ([]string, bool) {
 	}
 
 	h := sha256.New()
-	h.Write([]byte("strata-diskcache v1\x00" + path)) // the salt is fixed: a change invalidates every saved file's key
+	// The salt is the upstream project's name, and it is fixed: it is the chain
+	// root every saved file's keys are derived from, so renaming the project here
+	// would invalidate every .session file on disk. Do not "fix" it in a rebrand.
+	h.Write([]byte("strata-diskcache v1\x00" + path))
 	for i, f := range []json.RawMessage{b.System, b.Instructions, b.Tools, b.ReasoningEffort, b.Thinking, b.ESP, b.TemplateKwargs} {
 		if isSet(f) {
 			c := k.canon(f)

@@ -1,11 +1,11 @@
 version: 2
 
-project_name: gpu-arbiter
+project_name: vram-mux
 
 builds:
-  - id: gpu-arbiter
-    binary_name: gpu-arbiter
-    main: ./cmd/gpu-arbiter
+  - id: vram-mux
+    binary_name: vram-mux
+    main: ./cmd/vram-mux
     env: [CGO_ENABLED=0]
     goos: [linux]
     goarch: [amd64, arm64]

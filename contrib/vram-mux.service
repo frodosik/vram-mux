@@ -3,7 +3,7 @@
 # Run as the user Strata runs as, so the proxy can delete the files it writes.
 
 [Unit]
-Description=gpu-arbiter (disk conversation cache for Strata)
+Description=vram-mux (single Strata engine, disk conversation cache)
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
@@ -21,9 +21,9 @@ Environment=RETENTION_DAYS=7
 Environment=MIN_FREE_MIB=4096
 # stderr goes to the journal. To also keep rotated files:
 #Environment=LOG_OUTPUT=both
-#Environment=LOG_FILE=/var/log/gpu-arbiter/gpu-arbiter.log
-#LogsDirectory=gpu-arbiter
-ExecStart=/usr/local/bin/gpu-arbiter
+#Environment=LOG_FILE=/var/log/vram-mux/vram-mux.log
+#LogsDirectory=vram-mux
+ExecStart=/usr/local/bin/vram-mux
 Restart=always
 RestartSec=2
 # a little over --shutdown-s (20 s), so a save under way can finish

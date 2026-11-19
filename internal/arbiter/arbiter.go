@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/frodosik/gpu-arbiter/internal/engine"
+	"github.com/frodosik/vram-mux/internal/engine"
 )
 
 // Route is one resident identity: a backend and the model it is running.

@@ -18,10 +18,10 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/frodosik/gpu-arbiter/internal/arbiter"
-	"github.com/frodosik/gpu-arbiter/internal/engine"
-	"github.com/frodosik/gpu-arbiter/internal/store"
-	"github.com/frodosik/gpu-arbiter/internal/strata/stratatest"
+	"github.com/frodosik/vram-mux/internal/arbiter"
+	"github.com/frodosik/vram-mux/internal/engine"
+	"github.com/frodosik/vram-mux/internal/store"
+	"github.com/frodosik/vram-mux/internal/strata/stratatest"
 )
 
 type syncBuffer struct {

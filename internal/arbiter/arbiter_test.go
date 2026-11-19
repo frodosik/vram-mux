@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/frodosik/gpu-arbiter/internal/engine"
+	"github.com/frodosik/vram-mux/internal/engine"
 )
 
 // card is the shared GPU: both routes need the same bytes.

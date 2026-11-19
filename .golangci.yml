@@ -33,4 +33,4 @@ formatters:
   enable: [gofmt, goimports]
   settings:
     goimports:
-      local-prefixes: [github.com/frodosik/gpu-arbiter]
+      local-prefixes: [github.com/frodosik/vram-mux]

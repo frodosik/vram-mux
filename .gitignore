@@ -1,4 +1,4 @@
-/gpu-arbiter
+/vram-mux
 /dist/
 *.test
 *.out

@@ -6,7 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/frodosik/gpu-arbiter/internal/strata/stratatest"
+	"github.com/frodosik/vram-mux/internal/strata/stratatest"
 )
 
 func TestStatusEngineAndFingerprint(t *testing.T) {

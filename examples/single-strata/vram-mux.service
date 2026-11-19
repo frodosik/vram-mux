@@ -2,7 +2,7 @@
 # the proxy can delete the session files Strata writes. Start after Strata.
 
 [Unit]
-Description=gpu-arbiter (single Strata engine, disk conversation cache)
+Description=vram-mux (single Strata engine, disk conversation cache)
 After=network-online.target strata.service
 Wants=strata.service
 
@@ -14,8 +14,8 @@ Environment=LISTEN=:8080
 Environment=METRICS_LISTEN=127.0.0.1:8082
 Environment=UPSTREAM=http://127.0.0.1:8095
 Environment=STRATA_MODEL=qwen3.8-flash-next-iq2_xs
-Environment=STRATA_API_KEY=file:/etc/gpu-arbiter/api.keys
-Environment=SESSION_DIR=/var/lib/gpu-arbiter/sessions
+Environment=STRATA_API_KEY=file:/etc/vram-mux/api.keys
+Environment=SESSION_DIR=/var/lib/vram-mux/sessions
 Environment=MAX_GIB=40
 Environment=RETENTION_DAYS=7
 Environment=MIN_FREE_MIB=4096
@@ -29,7 +29,7 @@ Environment=SHUTDOWN_S=20
 Environment=LOG_OUTPUT=stderr
 Environment=LOG_FORMAT=json
 Environment=LOG_LEVEL=info
-ExecStart=/usr/local/bin/gpu-arbiter
+ExecStart=/usr/local/bin/vram-mux
 Restart=always
 RestartSec=5
 

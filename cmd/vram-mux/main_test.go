@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/frodosik/gpu-arbiter/internal/strata/stratatest"
+	"github.com/frodosik/vram-mux/internal/strata/stratatest"
 )
 
 func TestConfig(t *testing.T) {

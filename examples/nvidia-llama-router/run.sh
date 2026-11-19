@@ -6,7 +6,7 @@
 # install nvidia-smi, set --gpu-index to pin a card (-1 picks the most VRAM),
 # keep --vram-poll-s at 2 s.
 
-SESSIONS=/var/lib/gpu-arbiter/sessions
+SESSIONS=/var/lib/vram-mux/sessions
 
 # One router, presets loaded on demand, slots persisted, nothing preloaded.
 llama-server --models-preset ./presets.ini --models-max 1 --no-models-autoload \
@@ -16,7 +16,7 @@ llama-server --models-preset ./presets.ini --models-max 1 --no-models-autoload \
 # from request bytes because llama.cpp reports no token count; the yield at a
 # handoff writes the held conversation's file, so a return restores from disk
 # instead of re-prefilling. --load-timeout-s 600 covers drain + gate + load.
-gpu-arbiter \
+vram-mux \
   --listen :8080 --metrics-listen 127.0.0.1:8082 \
   --session-dir "$SESSIONS" \
   --route "llama|llama/27b|qwen3.8-27b|http://127.0.0.1:8001||18000" \

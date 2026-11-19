@@ -1,4 +1,4 @@
-// Command gpu-arbiter is a reverse proxy that owns one GPU for several engine
+// Command vram-mux is a reverse proxy that owns one GPU for several engine
 // processes (Strata, github.com/Niko1221/Strata, and llama.cpp servers), caches
 // conversations on disk, and restores them when a request needs one.
 package main
@@ -27,10 +27,10 @@ import (
 	"golang.org/x/sync/errgroup"
 	"gopkg.in/natefinch/lumberjack.v2"
 
-	"github.com/frodosik/gpu-arbiter/internal/arbiter"
-	"github.com/frodosik/gpu-arbiter/internal/engine"
-	"github.com/frodosik/gpu-arbiter/internal/proxy"
-	"github.com/frodosik/gpu-arbiter/internal/store"
+	"github.com/frodosik/vram-mux/internal/arbiter"
+	"github.com/frodosik/vram-mux/internal/engine"
+	"github.com/frodosik/vram-mux/internal/proxy"
+	"github.com/frodosik/vram-mux/internal/store"
 )
 
 // version is set at build time: -ldflags "-X main.version=v1.2.3".
@@ -92,7 +92,7 @@ type config struct {
 
 	Log struct {
 		Output     string `env:"OUTPUT" enum:"stderr,file,both" default:"stderr" help:"Where logs go: stderr, file or both."`
-		File       string `env:"FILE" default:"/var/log/gpu-arbiter/gpu-arbiter.log" help:"Log file, for file and both."`
+		File       string `env:"FILE" default:"/var/log/vram-mux/vram-mux.log" help:"Log file, for file and both."`
 		Format     string `env:"FORMAT" enum:"text,json" default:"text" help:"text or json."`
 		Level      string `env:"LEVEL" enum:"debug,info,warn,error" default:"info" help:"debug, info, warn or error."`
 		MaxSizeMiB int    `name:"max-size-mib" env:"MAX_SIZE_MIB" default:"100" help:"Rotate the log file at this size."`
@@ -206,9 +206,9 @@ func (c *config) routes() ([]arbiter.Route, error) {
 
 func parse(args []string) (*config, error) {
 	var c config
-	k, err := kong.New(&c, kong.Name("gpu-arbiter"),
+	k, err := kong.New(&c, kong.Name("vram-mux"),
 		kong.Description("One GPU, several engine processes: the arbiter owns model loads, and conversations are cached on disk."),
-		kong.Vars{"version": "gpu-arbiter " + version}, kong.UsageOnError())
+		kong.Vars{"version": "vram-mux " + version}, kong.UsageOnError())
 	if err != nil {
 		return nil, err
 	}
@@ -245,7 +245,7 @@ func newLogger(c *config, stderr io.Writer) (*slog.Logger, io.Closer, error) {
 
 func main() {
 	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "gpu-arbiter:", err)
+		fmt.Fprintln(os.Stderr, "vram-mux:", err)
 		os.Exit(1)
 	}
 }
