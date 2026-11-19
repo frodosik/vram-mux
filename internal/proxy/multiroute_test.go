@@ -629,28 +629,33 @@ func TestIdleSaveStepsOutForAQueuedRequest(t *testing.T) {
 // the session lost.
 func TestLearnedBytesPerTokenIsClamped(t *testing.T) {
 	p, strata, _, _, url, _, dir := twoRouteEnv(t)
-	strata.SavedTokens, strata.SaveBytes = 10, 3072000 // 300 KB/token
+	strata.Update(func(f *stratatest.Fake) { f.SavedTokens, f.SaveBytes = 10, 3072000 }) // 300 KB/token
 	if status, _ := postBody(t, url, withModel("flash", conversation("A", 2))); status != 200 {
 		t.Fatalf("status %d", status)
 	}
 	eventually(t, "the file", func() bool { return len(filesIn(t, p, "strata/flash", dir)) == 1 })
-	p.cache.mu.Lock()
-	bpt := p.cache.routes["strata/flash"].bpt
-	p.cache.mu.Unlock()
-	if bpt != 256<<10 {
+	// The route writes its learned figure after Commit indexes the file, so the
+	// read follows the save instead of racing the microseconds between them.
+	eventually(t, "the clamped bytes-per-token", func() bool { return routeBpt(p, "strata/flash") == 256<<10 })
+	if bpt := routeBpt(p, "strata/flash"); bpt != 256<<10 {
 		t.Errorf("bytes per token %d, want the 256 KB/token bound", bpt)
 	}
-	strata.SavedTokens, strata.SaveBytes = 10, 1000 // 100 bytes/token
+	strata.Update(func(f *stratatest.Fake) { f.SavedTokens, f.SaveBytes = 10, 1000 }) // 100 bytes/token
 	if status, _ := postBody(t, url, withModel("flash", conversation("B", 2))); status != 200 {
 		t.Fatalf("status %d", status)
 	}
 	eventually(t, "the second file", func() bool { return len(filesIn(t, p, "strata/flash", dir)) == 2 })
-	p.cache.mu.Lock()
-	bpt = p.cache.routes["strata/flash"].bpt
-	p.cache.mu.Unlock()
-	if bpt != 4<<10 {
+	eventually(t, "the clamped floor", func() bool { return routeBpt(p, "strata/flash") == 4<<10 })
+	if bpt := routeBpt(p, "strata/flash"); bpt != 4<<10 {
 		t.Errorf("bytes per token %d, want the 4 KB/token floor", bpt)
 	}
+}
+
+// routeBpt reads a route's learned bytes-per-token under the cache lock.
+func routeBpt(p *Proxy, id string) int64 {
+	p.cache.mu.Lock()
+	defer p.cache.mu.Unlock()
+	return p.cache.routes[id].bpt
 }
 
 // counterValue is one label value of a CounterVec.
@@ -794,7 +799,7 @@ func TestStrictOversizedBodyIsRefusedByTheSameRule(t *testing.T) {
 // it gives the card away, and that write is trigger="yield".
 func TestQueueWiringMakesTheIdleSaveStepOut(t *testing.T) {
 	p, _, llama, _, url, logs, dir := twoRouteEnvWith(t, envOpts{idle: 250 * time.Millisecond})
-	llama.LoadDelay = 400 * time.Millisecond
+	llama.LoadDelay = 400 * time.Millisecond // set before any request reaches the fake
 	if status, _ := postBody(t, url, withModel("flash", conversation("A", 3))); status != 200 {
 		t.Fatalf("status %d, want 200", status)
 	}

@@ -68,6 +68,9 @@ prefix index never aliases forward to a longer descendant's file. The fingerprin
 context, KV type and control vector; when any change, the old files are deleted, since the engine rejects them anyway.
 Files unused for `--retention-days` are deleted; the total is capped at `--max-gib`, least recently used first; before a
 save the store evicts until the file fits under the cap and leaves `--min-free-mib` free, and skips the save if it doesn't.
+The store's counts are the folder: a key keeps one file, so a save of the same last chain key deletes the older file of
+that key, and the cap counts the turn-boundary files the prefix index holds — `gpu_arbiter_files` and
+`gpu_arbiter_bytes` cover every session file the store owns, not the last-key files alone.
 
 **Restoring.** A request that continues the conversation the engine is holding goes straight through. On a switch, if the
 conversation is not parked in RAM and a file exists for it (or for an earlier turn, bound by the prompt estimate), the proxy

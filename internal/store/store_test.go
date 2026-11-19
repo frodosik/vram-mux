@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -42,6 +43,132 @@ func newStore(t *testing.T, maxBytes, free int64) (*Store, string, map[string]in
 		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 		FreeSpace: func(string) (int64, error) { return free, nil }})
 	return s, dir, evicted
+}
+
+// diskFiles is the folder as the disk reports it: every regular dc-*.session
+// whose name the store can index, by name and size. chain.jsonl, the engine's
+// temporaries, and files of other programs are not the store's. A dc-*.session
+// whose name the store cannot index is listed in unparseable: Load deletes
+// those, so one surviving means the index never owned it.
+func diskFiles(t *testing.T, dir string) (map[string]int64, []string) {
+	t.Helper()
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Errorf("the folder is unreadable: %v", err)
+		return map[string]int64{}, nil
+	}
+	disk, unparseable := map[string]int64{}, []string(nil)
+	for _, d := range ents {
+		name := d.Name()
+		info, err := d.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		if !strings.HasPrefix(name, "dc-") || !strings.HasSuffix(name, ".session") {
+			continue
+		}
+		if _, _, _, m := splitName(name); m == nil {
+			unparseable = append(unparseable, name)
+			continue
+		}
+		disk[name] = info.Size()
+	}
+	return disk, unparseable
+}
+
+// trackedNames is the index as the store reports it: one entry per file it owns,
+// the last-key entries in entries and the turn-boundary files held by the prefix
+// index, deduped.
+func trackedNames(s *Store) map[string]int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string]int64{}
+	for _, e := range s.all() {
+		out[e.Name()] = e.Size
+	}
+	return out
+}
+
+// assertDiskMatchesStats is the store's invariant: the index owns every session
+// file in the folder, every file it owns is on disk at the size it counts, and
+// the counted total is under the cap. A file dropped from entries, prefixes, or
+// totalBytes without unlinking it fails here, and so does a byte total the cap
+// never saw — the production leak: 569 files on disk, 39 counted, 712 GiB
+// against an 85.9 GB cap.
+func assertDiskMatchesStats(t *testing.T, dir string, s *Store) {
+	t.Helper()
+	disk, unparseable := diskFiles(t, dir)
+	if len(unparseable) > 0 {
+		t.Errorf("unparseable session files on disk: %v", unparseable)
+	}
+	index := trackedNames(s)
+	for name, size := range disk {
+		if _, ok := index[name]; !ok {
+			t.Errorf("orphan: %s (%d bytes) is on disk and not in the index", name, size)
+		}
+	}
+	for name, size := range index {
+		info, err := os.Stat(filepath.Join(dir, name))
+		if err != nil {
+			t.Errorf("%s is in the index and not on disk: %v", name, err)
+			continue
+		}
+		if info.Size() != size {
+			t.Errorf("%s: the index counts %d bytes, disk has %d", name, size, info.Size())
+		}
+	}
+	var bytes int64
+	for _, size := range disk {
+		bytes += size
+	}
+	files, counted := s.Stats()
+	if files != len(disk) {
+		t.Errorf("the index counts %d files, disk has %d", files, len(disk))
+	}
+	if counted != bytes {
+		t.Errorf("the index counts %d bytes, disk has %d", counted, bytes)
+	}
+	if counted > s.opt.MaxBytes {
+		t.Errorf("%d bytes counted exceeds the cap %d", counted, s.opt.MaxBytes)
+	}
+}
+
+// engineSave runs one save exactly as cache.save does: reserve the room, write
+// the file under the planned name, index it. The invariant is checked after every
+// step, so a leak fails at the save that made it.
+func engineSave(t *testing.T, s *Store, dir string, keys []string, tokens, size int, when time.Time) Entry {
+	t.Helper()
+	e := reserveWriteCommit(t, s, dir, keys, tokens, size, when)
+	if e.Tokens > 0 {
+		assertDiskMatchesStats(t, dir, s)
+	}
+	return e
+}
+
+// reserveWriteCommit is the same save without the invariant check: the window
+// between the engine writing and Commit indexing is a file the index does not
+// own yet, so parallel saves check the folder once, when they are all done.
+func reserveWriteCommit(t *testing.T, s *Store, dir string, keys []string, tokens, size int, when time.Time) Entry {
+	t.Helper()
+	name := FileName(ns, fp, keys[len(keys)-1], tokens)
+	if !s.Reserve(int64(size)) {
+		return Entry{}
+	}
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, make([]byte, size), 0o600); err != nil {
+		t.Errorf("write %s: %v", name, err)
+		return Entry{}
+	}
+	if err := os.Chtimes(p, when, when); err != nil {
+		t.Errorf("chtimes %s: %v", name, err)
+		return Entry{}
+	}
+	e, err := s.Commit(ns, fp, keys, tokens, tokens)
+	if err != nil {
+		t.Errorf("commit %s: %v", name, err)
+		return Entry{}
+	}
+	return e
 }
 
 func TestLoadCleansUp(t *testing.T) {
@@ -539,5 +666,339 @@ func TestLegacyFilesCountAgainstTheGlobalCap(t *testing.T) {
 	}
 	if n, bytes := s.Stats(); n != 1 || bytes != 250 {
 		t.Errorf("after the save: %d files %d bytes, want 1 250", n, bytes)
+	}
+}
+
+// The production leak: one conversation saved every 2-3 minutes, 150875 ->
+// 152461 -> 154050 -> 155032 tokens. A save is keyed by the last chain key, so
+// repeated saves of the same conversation overwrite the last-key entry with a
+// longer file, and the older file of that key stayed on disk with nothing
+// counting it. 50 growth saves of one key, 10k -> 155k tokens, must leave
+// exactly one file, and the cap must see every byte.
+func TestRepeatedGrowthSavesOnTheSameKeyLeaveNoOrphans(t *testing.T) {
+	maxBytes := int64(400 << 10)
+	s, dir, evicted := newStore(t, maxBytes, 1<<40)
+	start := time.Now()
+	chain := []string{key(1), key(2), key(3)}
+	tokens, written := 10000, int64(0)
+	saves := 0
+	for i := 0; i < 50; i++ {
+		size := 2 * tokens // 2 bytes per token: 50 saves are ~20x the cap
+		if e := engineSave(t, s, dir, chain, tokens, size, start.Add(time.Duration(i)*time.Minute)); e.Tokens > 0 {
+			saves++
+			written += int64(size)
+		}
+		tokens += 2900
+	}
+	if saves < 50 {
+		t.Fatalf("%d saves ran, want 50", saves)
+	}
+	if written < 5*maxBytes {
+		t.Fatalf("the saves wrote %d bytes, want over 5x the cap %d", written, maxBytes)
+	}
+	// One file: the newest save of the key. Every superseded file is unlinked.
+	want := FileName(ns, fp, key(3), tokens-2900)
+	if !exists(dir, want) {
+		t.Errorf("%s is not on disk", want)
+	}
+	if n, bytes := s.Stats(); n != 1 {
+		t.Errorf("%d files in the index, want 1 (the disk has %d bytes)", n, bytes)
+	}
+	assertDiskMatchesStats(t, dir, s)
+	// Every save unlinked exactly one older file of this key, either as the entry
+	// it replaced (superseded) or as the oldest under the cap (size).
+	if evicted["superseded"]+evicted["size"] != 49 {
+		t.Errorf("evictions %v, want one older file of the key unlinked by every save", evicted)
+	}
+}
+
+// 50 saves, each at its own turn boundary: the files of the earlier turns live
+// only in the prefix index, and the cap must count them. A restart loads the
+// folder, prunes it under the cap, rebuilds the prefix index, and the disk still
+// matches the index.
+func TestGrowthAcrossTurnBoundariesSurvivesRestart(t *testing.T) {
+	maxBytes := int64(2 << 20)
+	s, dir, _ := newStore(t, maxBytes, 1<<40)
+	start := time.Now()
+	tokens := 10000
+	var chain []string
+	var turns []struct {
+		keys   []string
+		tokens int
+	}
+	for i := 0; i < 50; i++ {
+		chain = append(chain, key(2*i+1), key(2*i+2)) // two new chain keys per turn
+		engineSave(t, s, dir, chain, tokens, 2*tokens, start.Add(time.Duration(i)*time.Minute))
+		turns = append(turns, struct {
+			keys   []string
+			tokens int
+		}{append([]string(nil), chain...), tokens})
+		tokens += 2900
+	}
+	// A fresh store on the same folder: Load indexes every file, replays the
+	// chain, and prunes the over-cap total at startup.
+	s2 := New(Options{Dir: dir, MaxBytes: maxBytes, MaxAge: 7 * 24 * time.Hour, MinFree: 100,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), FreeSpace: func(string) (int64, error) { return 1 << 40, nil }})
+	if err := s2.Load(); err != nil {
+		t.Fatal(err)
+	}
+	assertDiskMatchesStats(t, dir, s2)
+	if _, bytes := s2.Stats(); bytes > maxBytes {
+		t.Errorf("%d bytes after startup, want under the cap %d", bytes, maxBytes)
+	}
+	// Every turn boundary on disk is what its own key resolves to, and a file
+	// that is gone leaves no alias behind: Covered is exactly the disk.
+	surviving := 0
+	for i, tr := range turns {
+		name := FileName(ns, fp, tr.keys[len(tr.keys)-1], tr.tokens)
+		onDisk := exists(dir, name)
+		if onDisk != s2.Covered(ns, fp, tr.keys, tr.tokens) {
+			t.Errorf("turn %d: %s exists=%v, the index covers=%v", i, name, onDisk, s2.Covered(ns, fp, tr.keys, tr.tokens))
+		}
+		if !onDisk {
+			continue
+		}
+		surviving++
+		// A fork behind this boundary finds this file, not a deeper one.
+		fork := append(append([]string(nil), tr.keys...), key(1000+i))
+		if e, ok := s2.Lookup(ns, fp, fork, tr.tokens); !ok || e.Name() != name {
+			t.Errorf("fork behind turn %d: %+v %v, want %s", i, e, ok, name)
+		}
+	}
+	if surviving < 2 {
+		t.Errorf("%d turn-boundary files survived, want the newest turns kept", surviving)
+	}
+}
+
+// A commit whose rename lands on a name the index already owns: the file under
+// that name is unlinked with its entry before the rename buries it.
+func TestCommitRenameOntoATrackedNameUnlinksIt(t *testing.T) {
+	s, dir, evicted := newStore(t, 1<<30, 1<<40)
+	now := time.Now()
+	turn := []string{key(1), key(2), key(3)}
+	// The engine writes under the planned count, Commit renames it to the count
+	// the engine reported.
+	write(t, dir, name(3, 30000), 30000, now)
+	if e, err := s.Commit(ns, fp, turn, 30000, 30123); err != nil || e.Tokens != 30123 {
+		t.Fatalf("the first save: %+v %v", e, err)
+	}
+	assertDiskMatchesStats(t, dir, s)
+	// The next save planned 40000, the engine counted 30123: the rename lands on
+	// the name the index owns, so that entry and file go first.
+	write(t, dir, name(3, 40000), 40000, now.Add(time.Minute))
+	e, err := s.Commit(ns, fp, turn, 40000, 30123)
+	if err != nil || e.Tokens != 30123 {
+		t.Fatalf("the rename onto a tracked name: %+v %v", e, err)
+	}
+	assertDiskMatchesStats(t, dir, s)
+	if n, bytes := s.Stats(); n != 1 || bytes != 40000 {
+		t.Errorf("after the rename: %d files %d bytes, want 1 40000", n, bytes)
+	}
+	if evicted["superseded"] != 1 {
+		t.Errorf("evictions %v, want the overwritten file unlinked", evicted)
+	}
+}
+
+// Startup over the cap: every file is indexed, the total is pruned to the cap at
+// Load, and nothing is left on disk outside the index.
+func TestLoadPrunesTheFolderOverTheCapAtStartup(t *testing.T) {
+	s, dir, evicted := newStore(t, 300, 1<<40)
+	now := time.Now()
+	for i := 1; i <= 10; i++ { // 10 files, 1000 bytes total, over a 300-byte cap
+		write(t, dir, name(i, 10000+i), 100, now.Add(time.Duration(i-100)*time.Minute))
+	}
+	if err := s.Load(); err != nil {
+		t.Fatal(err)
+	}
+	assertDiskMatchesStats(t, dir, s)
+	if evicted["size"] != 7 {
+		t.Errorf("evictions %v, want 7 files pruned at startup", evicted)
+	}
+}
+
+// One key, several token counts on disk: Load keeps the longest and unlinks the
+// duplicates, so a key names one file.
+func TestLoadKeepsOneFilePerKey(t *testing.T) {
+	s, dir, _ := newStore(t, 1<<30, 1<<40)
+	now := time.Now()
+	write(t, dir, name(3, 10000), 100, now)
+	write(t, dir, name(3, 15000), 150, now.Add(time.Minute))
+	write(t, dir, name(3, 12000), 120, now.Add(2*time.Minute))
+	if err := s.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(dir, name(3, 15000)) {
+		t.Error("the longest file of the key did not survive")
+	}
+	for _, tokens := range []int{10000, 12000} {
+		if exists(dir, name(3, tokens)) {
+			t.Errorf("the duplicate %d-token file stayed on disk", tokens)
+		}
+	}
+	assertDiskMatchesStats(t, dir, s)
+}
+
+// Adopt renames a legacy file onto a name the index already owns: the file under
+// that name goes with its entry, and the folder keeps one file per key.
+func TestAdoptUnlinksTheFileItsRenameOverwrites(t *testing.T) {
+	s, dir, _ := newStore(t, 1<<30, 1<<40)
+	now := time.Now()
+	strata := NamespaceOf("strata", "flash-next")
+	write(t, dir, FileName("", fp, key(1), 20000), 100, now)
+	write(t, dir, FileName(strata, fp, key(1), 20000), 100, now.Add(time.Minute))
+	write(t, dir, FileName("", fp, key(2), 30000), 100, now.Add(2*time.Minute))
+	write(t, dir, FileName(strata, fp, key(2), 30000), 100, now.Add(3*time.Minute))
+	if err := s.Load(); err != nil {
+		t.Fatal(err)
+	}
+	assertDiskMatchesStats(t, dir, s)
+	if n := s.Adopt(strata, fp); n != 2 {
+		t.Fatalf("Adopt moved %d files, want 2", n)
+	}
+	for _, k := range []string{key(1), key(2)} {
+		if exists(dir, FileName("", fp, k, 20000)) || exists(dir, FileName("", fp, k, 30000)) {
+			t.Errorf("the legacy file of %s is still under its old name", k)
+		}
+	}
+	assertDiskMatchesStats(t, dir, s)
+	if n, bytes := s.Stats(); n != 2 || bytes != 200 {
+		t.Errorf("after Adopt: %d files %d bytes, want 2 200", n, bytes)
+	}
+	for _, k := range []string{key(1), key(2)} {
+		if _, ok := s.Lookup(strata, fp, []string{k}, 30000); !ok {
+			t.Errorf("the adopted file of %s is not found", k)
+		}
+	}
+}
+
+// The turn-boundary files the prefix index holds are under the cap: a save that
+// needs room evicts them, and the counted total is the disk.
+func TestTurnBoundaryFilesAreUnderTheCap(t *testing.T) {
+	s, dir, evicted := newStore(t, 250, 1<<40)
+	now := time.Now()
+	engineSave(t, s, dir, []string{key(1)}, 20000, 100, now)
+	engineSave(t, s, dir, []string{key(1), key(2), key(3)}, 30000, 100, now.Add(time.Minute))
+	// turn 1's file lives only in the prefix index; its bytes were never counted
+	e := engineSave(t, s, dir, []string{key(1), key(2), key(3), key(4), key(5)}, 40000, 100, now.Add(2*time.Minute))
+	if e.Tokens == 0 {
+		t.Fatal("the third save was refused")
+	}
+	if exists(dir, name(1, 20000)) {
+		t.Error("the oldest turn-boundary file survived the cap")
+	}
+	if _, ok := s.Lookup(ns, fp, []string{key(1), key(9)}, 25000); ok {
+		t.Error("a prefix key points at a file that is gone")
+	}
+	if evicted["size"] == 0 {
+		t.Errorf("evictions %v: the cap never saw a turn-boundary file", evicted)
+	}
+	assertDiskMatchesStats(t, dir, s)
+}
+
+// An aborted save: no file, so Commit refuses and nothing is left to index.
+func TestAbortedSaveLeavesNothingToIndex(t *testing.T) {
+	s, dir, _ := newStore(t, 1<<30, 1<<40)
+	if _, err := s.Commit(ns, fp, []string{key(1), key(2)}, 20000, 20000); err == nil {
+		t.Error("a commit with no file on disk succeeded")
+	}
+	assertDiskMatchesStats(t, dir, s)
+	// A save the engine finished, and a count that matches its file: indexed.
+	write(t, dir, name(2, 20000), 100, time.Now())
+	if e, err := s.Commit(ns, fp, []string{key(1), key(2)}, 20000, 20000); err != nil || e.Size != 100 {
+		t.Errorf("the planned file was not indexed: %+v %v", e, err)
+	}
+	assertDiskMatchesStats(t, dir, s)
+}
+
+// Saves run concurrently: two routes' idle and switch saves hit one store. Every
+// save reserves, writes, commits, and the folder must match the index at the
+// end. -race is what this test runs under.
+func TestConcurrentGrowthKeepsDiskAndIndexEqual(t *testing.T) {
+	s, dir, _ := newStore(t, 600<<10, 1<<40)
+	start := time.Now()
+	var wg sync.WaitGroup
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			tokens := 10000 + g*5000
+			for i := 0; i < 20; i++ {
+				reserveWriteCommit(t, s, dir, []string{key(1), key(2), key(3 + g)}, tokens, 2*tokens,
+					start.Add(time.Duration(i)*time.Minute+time.Duration(g)*time.Second))
+				tokens += 2900
+			}
+		}(g)
+	}
+	wg.Wait()
+	assertDiskMatchesStats(t, dir, s)
+	if n, bytes := s.Stats(); n == 0 || bytes > s.opt.MaxBytes {
+		t.Errorf("%d files %d bytes, want files under the cap %d", n, bytes, s.opt.MaxBytes)
+	}
+}
+
+// A turn-boundary alias and a last-key file can share a key: evicting the
+// boundary must not take the newer entry of that key with it. Deleting the map
+// slot by key, not by entry, leaves the newer file on disk with nothing counting
+// it — an orphan the cap never sees again.
+func TestEvictingATurnBoundaryKeepsTheLastKeyFileOfTheSameKey(t *testing.T) {
+	s, dir, evicted := newStore(t, 300, 1<<40)
+	now := time.Now()
+	engineSave(t, s, dir, []string{key(1)}, 10000, 100, now)                          // A at key(1)
+	engineSave(t, s, dir, []string{key(1), key(2)}, 15000, 100, now.Add(time.Minute)) // B at key(2), and A becomes a boundary
+	engineSave(t, s, dir, []string{key(1)}, 20000, 100, now.Add(2*time.Minute))       // C at key(1): entries[key(1)] is C, prefixes[key(1)] is A
+	// 300 bytes on disk, at the cap: a save of 100 needs room, so the oldest goes.
+	if !s.Reserve(100) {
+		t.Fatal("the save was refused at the cap")
+	}
+	if exists(dir, name(1, 10000)) {
+		t.Error("the turn-boundary file survived the cap")
+	}
+	if !exists(dir, name(1, 20000)) {
+		t.Error("the last-key file of key(1) was evicted with the boundary")
+	}
+	assertDiskMatchesStats(t, dir, s)
+	if evicted["size"] != 1 {
+		t.Errorf("evictions %v, want exactly the boundary file", evicted)
+	}
+	if e, ok := s.Lookup(ns, fp, []string{key(1), key(9)}, 12000); !ok || e.Name() != name(1, 20000) {
+		t.Errorf("key(1) after the boundary eviction: %+v %v, want the last-key file", e, ok)
+	}
+}
+
+// The legacy folder of the deployed build, with a namespaced file of the same key
+// already indexed: Adopt unlinks the file its rename overwrites, so one key keeps
+// one file and the counts stay the disk.
+func TestAdoptCollisionOverTheSameKey(t *testing.T) {
+	s, dir, _ := newStore(t, 1<<30, 1<<40)
+	now := time.Now()
+	strata := NamespaceOf("strata", "flash-next")
+	// key(1): the namespaced file has a different token count, so Adopt's map
+	// write replaces the entry; key(2): the namespaced name is exactly where the
+	// rename lands.
+	write(t, dir, FileName("", fp, key(1), 20000), 100, now)
+	write(t, dir, FileName(strata, fp, key(1), 40000), 100, now.Add(time.Minute))
+	write(t, dir, FileName("", fp, key(2), 30000), 100, now.Add(2*time.Minute))
+	write(t, dir, FileName(strata, fp, key(2), 30000), 100, now.Add(3*time.Minute))
+	if err := s.Load(); err != nil {
+		t.Fatal(err)
+	}
+	assertDiskMatchesStats(t, dir, s)
+	if n := s.Adopt(strata, fp); n != 2 {
+		t.Fatalf("Adopt moved %d files, want 2", n)
+	}
+	assertDiskMatchesStats(t, dir, s)
+	if n, bytes := s.Stats(); n != 2 || bytes != 200 {
+		t.Errorf("after Adopt: %d files %d bytes, want 2 200", n, bytes)
+	}
+	for _, k := range []string{key(1), key(2)} {
+		if exists(dir, FileName("", fp, k, 20000)) || exists(dir, FileName("", fp, k, 30000)) {
+			t.Errorf("the legacy file of %s is still under its old name", k)
+		}
+	}
+	if !exists(dir, FileName(strata, fp, key(2), 30000)) {
+		t.Error("the adopted file of key(2) is not on disk")
+	}
+	if _, ok := s.Lookup(strata, fp, []string{key(1)}, 20000); !ok {
+		t.Error("the adopted file of key(1) is not found")
 	}
 }

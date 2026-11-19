@@ -53,12 +53,19 @@ type env struct {
 // it did before the arbiter existed.
 func setup(t *testing.T, idle time.Duration, maxBody int64) *env {
 	t.Helper()
+	return setupCap(t, idle, maxBody, 64<<30)
+}
+
+// setupCap is setup with the store's size cap: a cap the saves overshoot is the
+// production shape, and the only way to watch the cap and the disk agree.
+func setupCap(t *testing.T, idle time.Duration, maxBody, maxBytes int64) *env {
+	t.Helper()
 	e := &env{t: t, dir: t.TempDir(), logs: &syncBuffer{}, avail: 8 << 30}
 	e.f = stratatest.New(e.dir)
 	up := httptest.NewServer(e.f)
 	t.Cleanup(up.Close)
 	log := slog.New(slog.NewJSONHandler(e.logs, nil))
-	e.st = store.New(store.Options{Dir: e.dir, MaxBytes: 64 << 30, MaxAge: time.Hour, Log: log,
+	e.st = store.New(store.Options{Dir: e.dir, MaxBytes: maxBytes, MaxAge: time.Hour, Log: log,
 		FreeSpace: func(string) (int64, error) { return 1 << 40, nil }})
 	if err := e.st.Load(); err != nil {
 		t.Fatal(err)
@@ -1308,4 +1315,77 @@ func TestRootBoundarySurvivesStaleBigCount(t *testing.T) {
 	want(t, "the switch away from B", e.turn("Z", 1), actMiss)
 	e.f.Set(8100, 0)
 	want(t, "the fork launch", e.turn("B", 2), actDisk)
+}
+
+// folderMatchesStore is the store's invariant as the proxy sees it: every session
+// file in the folder is in the index, the bytes the index counts are the bytes on
+// disk, and the counted total is under the cap. The window between the engine
+// writing a file and Commit indexing it is microseconds, so the check waits for
+// it; a file the index dropped without unlinking never heals, so the check fails.
+func folderMatchesStore(t *testing.T, dir string, st *store.Store, maxBytes int64) {
+	t.Helper()
+	var last string
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		m, _ := filepath.Glob(filepath.Join(dir, "dc-*.session"))
+		var bytes int64
+		for _, p := range m {
+			info, err := os.Stat(p)
+			if err != nil {
+				t.Fatalf("%s is gone: %v", filepath.Base(p), err)
+			}
+			bytes += info.Size()
+		}
+		files, counted := st.Stats()
+		last = fmt.Sprintf("%d files %d bytes on disk; the index counts %d files %d bytes against cap %d",
+			len(m), bytes, files, counted, maxBytes)
+		if files == len(m) && counted == bytes && counted <= maxBytes {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the folder does not match the index: %s", last)
+		}
+	}
+}
+
+// The cache's own save path under a tight cap: 100 saves of one growing
+// conversation, each at its own turn boundary, through cache.save — reserve the
+// room, the engine writes, Commit indexes. The folder must match the store's
+// counts at every step: the prefix-index turn-boundary files are under the cap
+// exactly like the last-key files, so the disk never grows past the cap. This is
+// the production shape: 569 files on disk against 39 counted.
+func TestCacheSaveKeepsTheFolderMatchingTheIndex(t *testing.T) {
+	maxBytes := int64(3 << 20)
+	e := setupCap(t, 0, 64<<20, maxBytes)
+	e.f.Update(func(f *stratatest.Fake) { f.SaveBytes = 200000 })
+	c := e.p.cache
+	c.pol.MinTokens = 10 // the conversation is short; the cap is the point
+	r := c.route("strata/test-model")
+	e.turn("A", 1) // the route learns its fingerprint
+	if r.fp == "" {
+		t.Fatal("the route learned no fingerprint")
+	}
+	r.bpt = minBPT // the figure a route learns from a dense save, at the clamp floor
+	tokens, seen := 300, 0
+	for i := 1; i <= 100; i++ {
+		e.f.Set(tokens, 0)
+		keys, ok := c.keys.keys("/v1/chat/completions", []byte(conversation("A", i)))
+		if !ok {
+			t.Fatalf("turn %d cannot be keyed", i)
+		}
+		c.save(context.Background(), r, r.fp, keys, tokens, tokens, "test")
+		seen += saves(e.f.Take())
+		folderMatchesStore(t, e.dir, e.st, maxBytes)
+	}
+	if seen < 90 {
+		t.Errorf("%d saves ran, want the saves to run at each turn boundary", seen)
+	}
+	if int64(seen)*200000 < 5*maxBytes {
+		t.Errorf("the saves wrote %d bytes, want over 5x the cap %d", int64(seen)*200000, maxBytes)
+	}
+	if n, bytes := e.st.Stats(); bytes > maxBytes {
+		t.Errorf("%d bytes counted, %d files: the cap does not bound the folder", bytes, n)
+	}
+	if n, _ := e.st.Stats(); n < 2 {
+		t.Errorf("%d files, want the newest turn boundaries kept under the cap", n)
+	}
 }

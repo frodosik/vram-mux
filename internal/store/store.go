@@ -28,6 +28,15 @@
 // requesting prompt: the engine reuses a restore only when live ≤ prompt.
 // chain.jsonl, one line per Commit, records each committed file's full key
 // chain; Load replays it to rebuild the prefix index at startup.
+//
+// The invariant: the index owns every file in the folder that is ours, and
+// every file it owns is counted. A key names one file; an entry superseded,
+// adopted, pruned, forgotten, or pointed at a file that has changed is dropped
+// with os.Remove on its file, and the prefix aliases to it go with it. Stats is
+// the disk: the cap, the LRU, the age limit and the floor all read every file
+// the store tracks, the last-key files in entries and the turn-boundary files
+// the prefix index holds, so a file can never leave the accounting and grow on
+// disk untracked.
 package store
 
 import (
@@ -196,8 +205,15 @@ func (s *Store) remove(name, why string, size int64) {
 
 // drop removes e from the index and the disk; mu held. Prefix keys that point
 // to this entry go with it: a prefix key must never name a file that is gone.
+// The last-key slot is deleted only when it holds this entry: a turn-boundary
+// alias and the last-key file can share a key, and evicting the boundary must
+// not drop the newer entry of that key, whose file would then sit on disk with
+// nothing counting it.
 func (s *Store) drop(e *Entry, why string) {
-	delete(s.entries, e.Namespace+"/"+e.Fingerprint+"/"+e.Key)
+	id := e.Namespace + "/" + e.Fingerprint + "/" + e.Key
+	if s.entries[id] == e {
+		delete(s.entries, id)
+	}
 	for id, p := range s.prefixes {
 		if p == e {
 			delete(s.prefixes, id)
@@ -206,25 +222,62 @@ func (s *Store) drop(e *Entry, why string) {
 	s.remove(e.Name(), why, e.Size)
 }
 
-// byAge lists the entries, least recently used first; mu held.
+// byAge lists the tracked files, least recently used first; mu held.
 func (s *Store) byAge() []*Entry {
-	l := make([]*Entry, 0, len(s.entries))
-	for _, e := range s.entries {
-		l = append(l, e)
-	}
+	l := s.all()
 	slices.SortFunc(l, func(a, b *Entry) int { return a.Used.Compare(b.Used) })
 	return l
 }
 
-// Stats is the number of files and their total size.
+// all lists every file the store tracks, once: the last-key entries in entries
+// and the turn-boundary files the prefix index holds. A prefix alias points to
+// the entry of the file saved when its key was terminal, so the same file can
+// be named by a last-key entry and a prefix key at once: it is counted once.
+// The size cap, the LRU, the age limit and Stats read this set, so a
+// turn-boundary file is under the cap exactly like a last-key file, and the
+// count is the number of files on disk. mu held.
+func (s *Store) all() []*Entry {
+	seen := make(map[*Entry]bool, len(s.entries)+len(s.prefixes))
+	out := make([]*Entry, 0, len(s.entries)+len(s.prefixes))
+	for _, e := range s.entries {
+		if !seen[e] {
+			seen[e] = true
+			out = append(out, e)
+		}
+	}
+	for _, e := range s.prefixes {
+		if !seen[e] {
+			seen[e] = true
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// owners lists the tracked entries whose file is name, across both maps, once;
+// mu held. The index must never point two entries at one file, and it must
+// never overwrite an entry that owns name: the file would stay on disk with
+// nothing counting it.
+func (s *Store) owners(name string) []*Entry {
+	var out []*Entry
+	for _, e := range s.all() {
+		if e.Name() == name {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// Stats is the number of files and their total size: what the store tracks is
+// what is on disk.
 func (s *Store) Stats() (files int, bytes int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.entries), s.total()
+	return len(s.all()), s.total()
 }
 
 func (s *Store) total() (t int64) {
-	for _, e := range s.entries {
+	for _, e := range s.all() {
 		t += e.Size
 	}
 	return t
@@ -265,7 +318,11 @@ func (s *Store) KeepFingerprint(namespace, fingerprint string) {
 // Adopt moves the legacy files of fingerprint fingerprint into namespace,
 // renaming them on disk so the scope is recorded in the name and survives a
 // restart. It returns how many files moved. Files of another namespace, and
-// files of another fingerprint, are not touched.
+// files of another fingerprint, are not touched. A namespaced file already at the
+// name the rename lands on, and the entry already keyed by the name the legacy
+// file moves to, are unlinked with their entries first: the rename would
+// overwrite them, and an entry replaced by the map write would leave its file on
+// disk with nothing counting it.
 func (s *Store) Adopt(namespace, fingerprint string) int {
 	if namespace == "" || !namespaceRe.MatchString(namespace) {
 		return 0
@@ -273,22 +330,30 @@ func (s *Store) Adopt(namespace, fingerprint string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := 0
-	for _, e := range s.entries {
+	for _, e := range s.all() { // a legacy file can be a turn-boundary in the prefix index
 		if e.Namespace != "" || e.Fingerprint != fingerprint {
 			continue
 		}
 		old := filepath.Join(s.opt.Dir, e.Name())
+		moved := FileName(namespace, fingerprint, e.Key, e.Tokens)
+		// Two entries cannot own one key: the entry already keyed here goes with
+		// its file, and so does any entry whose name the rename lands on.
+		if prev := s.entries[namespace+"/"+fingerprint+"/"+e.Key]; prev != nil && prev != e {
+			s.drop(prev, "adopt")
+		}
+		for _, o := range s.owners(moved) {
+			s.drop(o, "adopt")
+		}
 		e.Namespace = namespace
 		if err := os.Rename(old, filepath.Join(s.opt.Dir, e.Name())); err != nil {
 			e.Namespace = ""
 			s.opt.Log.Warn("adopt rename", "file", filepath.Base(old), "namespace", namespace, "err", err)
 			continue
 		}
-		move := e // re-key the index entry in place
 		delete(s.entries, "/"+e.Fingerprint+"/"+e.Key)
-		s.entries[namespace+"/"+e.Fingerprint+"/"+e.Key] = move
-		for id, p := range s.prefixes { // re-key its prefix aliases the same way
-			if p == move {
+		s.entries[namespace+"/"+e.Fingerprint+"/"+e.Key] = e // re-key the entry in place
+		for id, p := range s.prefixes {                      // re-key its prefix aliases the same way
+			if p == e {
 				delete(s.prefixes, id)
 				k := strings.TrimPrefix(id, "/"+p.Fingerprint+"/") // the prefix key the alias is keyed by
 				s.prefixes[namespace+"/"+p.Fingerprint+"/"+k] = p
@@ -303,12 +368,13 @@ func (s *Store) Adopt(namespace, fingerprint string) int {
 }
 
 // AnyFingerprint returns the fingerprint of the most recently used session file
-// of namespace, or "".
+// of namespace, or "". Files the prefix index holds count too: a route whose
+// last-key files were pruned still has its turn-boundary files on disk.
 func (s *Store) AnyFingerprint(namespace string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var best *Entry
-	for _, e := range s.entries {
+	for _, e := range s.all() {
 		if e.Namespace != namespace {
 			continue
 		}
@@ -415,31 +481,59 @@ func (s *Store) Covered(namespace, fingerprint string, keys []string, tokens int
 // key with no file of its own stays empty — a prefix key at chain index i may
 // only name a file saved when keys[i] was that save's terminal key, never a
 // longer descendant file, so Lookup's prompt bound is never fooled by an alias.
+//
+// The last key is the one key Commit overwrites, and it is where the leak starts.
+// A conversation saved again past --regrow-tokens keeps its chain keys, so its
+// next save is keyed by the SAME last key with a longer token count: a different
+// file name. The older file of that key is superseded and unlinked here, so a key
+// names one file and the disk never keeps a state the index forgot. The same rule
+// covers the name the rename lands on — a tracked file under it is unlinked
+// before the rename buries it — and a file the engine wrote that indexing cannot
+// confirm, whose leftover is removed on the way out. Nothing is left on disk that
+// Stats does not count.
 func (s *Store) Commit(namespace, fingerprint string, keys []string, planned, tokens int) (Entry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := keys[len(keys)-1]
+	id := namespace + "/" + fingerprint + "/" + key
+	plannedName := FileName(namespace, fingerprint, key, planned)
 	e := &Entry{Namespace: namespace, Fingerprint: fingerprint, Key: key, Tokens: planned}
+	// An older save of this same key is superseded. Its file is a different name,
+	// so it goes now: deleting the entry alone leaves it on disk, uncounted,
+	// outside the cap, the LRU and the age limit for good.
+	if old := s.entries[id]; old != nil && old.Name() != plannedName {
+		s.drop(old, "superseded")
+	}
 	if tokens > 0 && tokens != planned {
-		from := filepath.Join(s.opt.Dir, e.Name())
+		// The file lands on the engine's own count. A tracked file of that name is
+		// overwritten by the rename, so its entry and file go first.
+		target := FileName(namespace, fingerprint, key, tokens)
+		for _, o := range s.owners(target) {
+			s.drop(o, "superseded")
+		}
 		e.Tokens = tokens
-		if err := os.Rename(from, filepath.Join(s.opt.Dir, e.Name())); err != nil {
+		if err := os.Rename(filepath.Join(s.opt.Dir, plannedName), filepath.Join(s.opt.Dir, e.Name())); err != nil {
 			e.Tokens = planned
 		}
 	}
 	info, err := os.Stat(filepath.Join(s.opt.Dir, e.Name()))
 	if err != nil {
+		// Nothing to index. The engine's file is then under the planned name: the
+		// leftover of a rename that failed. Unlink it; the caller never hears of it.
+		if e.Name() != plannedName {
+			s.remove(plannedName, "not_indexed", 0)
+		}
 		return Entry{}, fmt.Errorf("saved file: %w", err)
 	}
 	e.Size, e.Used = info.Size(), info.ModTime()
 	for _, k := range keys[:len(keys)-1] {
-		id := namespace + "/" + fingerprint + "/" + k
-		if old := s.entries[id]; old != nil && old.Name() != e.Name() {
-			delete(s.entries, id)
-			s.prefixes[id] = old // the turn-boundary file keeps its key; the file stays
+		pid := namespace + "/" + fingerprint + "/" + k
+		if old := s.entries[pid]; old != nil && old.Name() != e.Name() {
+			delete(s.entries, pid)
+			s.prefixes[pid] = old // the turn-boundary file keeps its key; the file stays
 		}
 	}
-	s.entries[namespace+"/"+fingerprint+"/"+key] = e
+	s.entries[id] = e
 	s.appendChain(namespace, fingerprint, keys, e)
 	return *e, nil
 }

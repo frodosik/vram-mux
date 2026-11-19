@@ -60,6 +60,31 @@
 - An oversized generation body is registered as engine-touching at admission (`inflight`/`seq`), the bookkeeping a
   keyed request pays: the idle save of the turn before it finds the card busy and steps out, instead of writing
   behind the request and holding the save lock for its length.
+
+### Fixed
+
+- **Every file the store tracks is unlinked when it leaves the index.** A conversation saved again past
+  `--regrow-tokens` is keyed by the same last chain key with a longer token count, so `Commit` replaced the entry
+  for that key and left the older `dc-<ns>-<fp>-<key>-<oldTokens>.session` on disk with nothing counting it: the
+  production leak, 530 orphan files, one per repeated save of a growing conversation. The superseded file goes, as
+  does a file a rename lands on, a legacy file `Adopt` overwrites, an entry `drop` evicts from a key it no longer
+  owns, and the leftover of a rename that failed.
+- **The turn-boundary files the prefix index holds are under the cap.** The size cap, the LRU, the age limit, the
+  free-space floor and `Stats` read only `entries`, so a file moved into the prefix index at a turn boundary left
+  the accounting and the folder grew without bound. The cap, the gauges and the disk are now one set: the store
+  counts every file it owns, deduped. Production shape: 569 files and 712 GiB on disk against
+  `gpu_arbiter_files = 39` and `gpu_arbiter_bytes = 78.09 GB` under an 85.9 GB cap.
+- **`gpu_arbiter_files` / `gpu_arbiter_bytes` are the folder**: `Stats` reports the files the store owns, so a
+  scrape that says the cap is not reached says the folder is not reached. `Load()` prunes the whole folder, counted
+  this way, under `--max-gib` at startup, and keeps the longest file of a key that has several.
+
+### Added
+
+- `internal/store` asserts the invariant in tests: `assertDiskMatchesStats` sums the folder's `dc-*.session`
+  files and their bytes and requires the count, the bytes, and the cap to match the index after every save, so a
+  file the index dropped without unlinking it fails at the save that made it. The suite runs 50 growth saves
+  (10k → 155k tokens, 20x the cap), 100 saves through `cache.save` under a cap the saves overshoot 5x over,
+  restarts, prefix-index rebuilds, `Adopt` collisions, and parallel saves under `-race`.
 - **A control POST is checked against the resident too**: in strict mode a POST outside the three generation
   paths is read for a model name (a 64 KiB prefix) before a byte reaches an engine, and a POST naming a model that
   is not the resident's, or that no route serves, is answered 404 with no engine touched; the rest of the body is
